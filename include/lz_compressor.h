@@ -1,9 +1,17 @@
 #pragma once
 #include <span>
 #include <cstdint>
+#include <cstddef>
 
+enum class LZMode {
+    V2B, // Version 2-Byte (4KB Window)
+    V3B  // Version 3-Byte (64KB Window)
+};
+
+template <LZMode Mode>
 class LZCompressor {
 public:
+
     /**
      * @brief Returns the maximum possible buffer size required to compress the input.
      * @param input_size The size of the data to be compressed.

@@ -7,10 +7,15 @@
 class CompressionClassifier {
 public:
     /**
-     * @brief Analyzes a chunk and returns a ranked list of the best
-     *        compression candidates.
-     * @param data The input data chunk.
-     * @return A vector of CompressorType enums, ordered from best to worst.
+     * @brief Analyzes input, populates the delta_buffer, and determines best strategy.
+     * 
+     * @param input The raw input data.
+     * @param delta_buffer A pre-allocated buffer (must be size >= input.size()).
+     *                     The classifier WILL write the delta-transformed data here.
+     * @return Ranked list of compression strategies.
      */
-    std::array<CompressorType, 3> get_best_candidates(std::span<const uint8_t> input);
+    std::array<CompressorType, 4> get_best_candidates(
+        std::span<const uint8_t> input, 
+        std::span<uint8_t> delta_buffer
+    );
 };

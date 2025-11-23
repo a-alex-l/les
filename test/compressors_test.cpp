@@ -129,5 +129,10 @@ TYPED_TEST_P(CompressorTest, RoundTrip) {
 }
 
 REGISTER_TYPED_TEST_SUITE_P(CompressorTest, RoundTrip);
-using CompressorTypes = ::testing::Types<HuffmanCompressor, FSECompressor, LZCompressor>;
+using CompressorTypes = ::testing::Types<
+    HuffmanCompressor,
+    FSECompressor,
+    LZCompressor<LZMode::V2B>,
+    LZCompressor<LZMode::V3B>
+>;
 INSTANTIATE_TYPED_TEST_SUITE_P(AllCompressors, CompressorTest, CompressorTypes);

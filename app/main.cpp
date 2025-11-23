@@ -1,7 +1,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include "chunker.h" 
+#include "chunker.h"
 #include "cxxopts.hpp"
 
 int main(int argc, char* argv[]) {
@@ -9,7 +9,7 @@ int main(int argc, char* argv[]) {
 
     options.add_options()
         // Implicit value allows "les -c" to mean Level 9
-        ("c,compress", "Enable compression mode with optional level (1-9)", cxxopts::value<int>()->implicit_value("9"))
+        ("c,compress", "Enable compression mode with optional level (1-9)", cxxopts::value<int>()->implicit_value("5"))
         ("i,input", "Input file", cxxopts::value<std::string>())
         ("o,output", "Output file (optional)", cxxopts::value<std::string>())
         ("h,help", "Print usage information")
