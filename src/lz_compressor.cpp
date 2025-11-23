@@ -89,8 +89,11 @@ size_t LZCompressor::compress(std::span<const uint8_t> input, std::span<uint8_t>
             while (current_match != -1 && chain_len < max_chain) {
                 size_t dist = current_pos_idx - current_match;
                 
-                // Distance must be valid (within window and non-zero)
-                if (dist > WINDOW_SIZE || dist == 0) break;
+                // Distance check:
+                // FIX: Changed from (> WINDOW_SIZE) to (>= WINDOW_SIZE).
+                // Dist 4096 masks to 0 in 12-bit encoding (4096 & 0xFFF == 0),
+                // which causes decompression to fail. We limit dist to 4095.
+                if (dist >= WINDOW_SIZE || dist == 0) break;
 
                 // Optimization: Check the match length only if first byte matches
                 const uint8_t* match_ptr = input.data() + current_match;
@@ -122,14 +125,12 @@ size_t LZCompressor::compress(std::span<const uint8_t> input, std::span<uint8_t>
             control_byte |= (1 << token_count);
             
             // Format: [4 bits len-3] [12 bits dist]
+            // Note: best_dist is guaranteed < 4096 here due to the fix above
             uint16_t token = static_cast<uint16_t>(((best_len - MIN_MATCH_LEN) << 12) | (best_dist & 0xFFF));
             token_buffer[token_buf_idx++] = token & 0xFF;
             token_buffer[token_buf_idx++] = (token >> 8) & 0xFF;
 
             anchor += best_len;
-            
-            // Optional: Update hash for skipped bytes (omitted for speed, similar to LZ4)
-            // If you want max compression, you would loop and update hashes here.
         } else {
             // LITERAL
             // Control bit is 0 (default), just write byte
@@ -202,13 +203,17 @@ size_t LZCompressor::decompress(std::span<const uint8_t> input, std::span<uint8_
                 size_t len = (token >> 12) + MIN_MATCH_LEN;
                 size_t dist = token & 0xFFF;
 
-                if (dist == 0 || dist > bytes_decoded) throw std::runtime_error("Invalid distance");
+                // Safety Check:
+                // dist cannot be 0 (LZ77 doesn't allow offset 0)
+                // dist cannot be larger than what we've written (can't read before buffer start)
+                if (dist == 0 || dist > bytes_decoded) {
+                    throw std::runtime_error("Invalid distance");
+                }
 
                 // Optimization: Tight copy loop
                 uint8_t* src = op - dist;
                 
-                // Overlap handling requires byte-by-byte or careful copy
-                // (Cannot use memcpy)
+                // Handle overlap (src < op) safely
                 while(len--) {
                     *op++ = *src++;
                 }

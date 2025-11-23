@@ -2,3 +2,5 @@ build
 data
 bench/venv
 .vscode
+chart.png
+benchmark_results.csv

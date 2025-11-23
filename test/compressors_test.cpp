@@ -57,22 +57,18 @@ TYPED_TEST_P(CompressorTest, RoundTrip) {
         window_killer += "ABCDEF";
         inputs.push_back(window_killer);
 
-        // --- RANDOMIZER START ---
-        // 1. Binary Random Data (Keep existing)
         const size_t binary_data_size = 2 * 1024;
         std::string binary_data;
         binary_data.resize(binary_data_size);
-        std::mt19937 gen(12345); // Fixed seed for binary data
+        std::mt19937 gen(12345);
         std::uniform_int_distribution<> dist_byte(0, 255);
         std::generate(binary_data.begin(), binary_data.end(), [&]() { return static_cast<char>(dist_byte(gen)); });
         inputs.push_back(binary_data);
 
-        // 2. Visible Character Randomizer (New Request)
-        // We use std::random_device so it generates NEW data every time you run the test
         std::random_device rd;
         std::mt19937 gen_visible(rd());
-        std::uniform_int_distribution<> dist_visible(32, 126); // ASCII 32 (Space) to 126 (~)
-        std::uniform_int_distribution<> dist_len(1, 5000);      // Random length between 1 and 200 chars
+        std::uniform_int_distribution<> dist_visible(32, 126);
+        std::uniform_int_distribution<> dist_len(1, 5000);
 
         for(int i = 0; i < 100; ++i) {
             int len = dist_len(gen_visible);
@@ -83,33 +79,26 @@ TYPED_TEST_P(CompressorTest, RoundTrip) {
             }
             inputs.push_back(s);
         }
-        // --- RANDOMIZER END ---
 
         return inputs;
     };
 
     for (const auto& original_str : generateTestInputs()) {
-        // --- PRE-TEST LOGGING ---
-        // We print this BEFORE processing. If the test Crashes (Segfault),
-        // the last line in your console is the data you need to add to your hardcoded list.
-        // We verify if it's printable to avoid spamming binary data to console.
+
         bool is_printable = std::all_of(original_str.begin(), original_str.end(), [](unsigned char c){ 
             return c >= 32 && c <= 126; 
         });
 
         if (is_printable && original_str.length() < 300) {
-           // Uncomment this line if you want to see every string being tested in real time:
            // std::cout << "[ TESTING ] " << escape_for_code(original_str) << std::endl;
         }
-        // ------------------------
-        for (int level = 1; level < 10; ++level) {
+
+        for (int level = -12; level < 10; ++level) {
 
             std::vector<uint8_t> original_data = to_u8_vec(original_str);
 
             TypeParam compressor;
 
-            // Use ScopedTrace so that if an assertion fails, GTest prints the input string automatically
-            // This helps you find the error without crashing.
             SCOPED_TRACE("Input String: " + (original_str.length() > 100 && !is_printable ? "[Binary Data]" : escape_for_code(original_str)));
             SCOPED_TRACE("Compression Level: " + std::to_string(level));
 
@@ -117,8 +106,7 @@ TYPED_TEST_P(CompressorTest, RoundTrip) {
             std::vector<uint8_t> decompressed_data(original_data.size());
 
             size_t compressed_size = 0;
-            
-            // Catch exceptions during compression
+
             try {
                 compressed_size = compressor.compress(original_data, compressed_data, level);
             } catch (const std::exception& e) {

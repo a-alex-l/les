@@ -70,14 +70,6 @@ def main():
             "decompress_cmd": lambda exe, inp, out: [exe, "-i", inp, "-o", out],
             "use_stdout": False
         },
-        "lz4": {
-            "exe": "lz4",
-            "ext": ".lz4",
-            "levels": range(1, 10, 2), # 1 to 9
-            "compress_cmd": lambda exe, lvl, inp, out: [exe, "-f", f"-{lvl}", inp, out],
-            "decompress_cmd": lambda exe, inp, out: [exe, "-d", "-f", inp, out],
-            "use_stdout": False
-        },
         "gzip": {
             "exe": "gzip",
             "ext": ".gz",
@@ -85,6 +77,14 @@ def main():
             "compress_cmd": lambda exe, lvl, inp, out: [exe, "-c", f"-{lvl}", inp],
             "decompress_cmd": lambda exe, inp, out: [exe, "-d", "-c", inp],
             "use_stdout": True 
+        },
+        "lz4": {
+            "exe": "lz4",
+            "ext": ".lz4",
+            "levels": range(1, 10, 2), # 1 to 9
+            "compress_cmd": lambda exe, lvl, inp, out: [exe, "-f", f"-{lvl}", inp, out],
+            "decompress_cmd": lambda exe, inp, out: [exe, "-d", "-f", inp, out],
+            "use_stdout": False
         },
         "zstd": {
             "exe": "zstd",
