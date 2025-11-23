@@ -1,7 +1,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include "parallelizer.h" 
+#include "chunker.h" 
 #include "cxxopts.hpp"
 
 int main(int argc, char* argv[]) {
@@ -60,7 +60,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         
-        Parallelizer parallelizer;
+        Chunker parallelizer;
 
         if (compress_mode) {
             int level = result["compress"].as<int>();

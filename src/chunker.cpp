@@ -1,4 +1,4 @@
-#include "parallelizer.h"
+#include "chunker.h"
 #include "compression_classifier.h"
 #include "compressor_types.h"
 #include "huffman_compressor.h"
@@ -24,7 +24,7 @@ namespace {
     }
 }
 
-void Parallelizer::compress_file(const std::string& input_file, const std::string& output_file, int level) {
+void Chunker::compress_file(const std::string& input_file, const std::string& output_file, int level) {
     const size_t chunk_size = get_chunk_size_for_level(level);
 
     std::ifstream in(input_file, std::ios::binary);
@@ -37,34 +37,25 @@ void Parallelizer::compress_file(const std::string& input_file, const std::strin
 
     // Reusable buffers to minimize memory allocations
     std::vector<uint8_t> input_chunk(chunk_size);
-    std::vector<uint8_t> compression_buffer; 
+    std::vector<uint8_t> compression_buffer;
     std::vector<uint8_t> best_buffer;
 
     while (in) {
-        // 1. Read Chunk
         in.read(reinterpret_cast<char*>(input_chunk.data()), chunk_size);
         size_t bytes_read = in.gcount();
         if (bytes_read == 0) break;
 
-        // Create a view of the actual data read
         std::span<const uint8_t> current_span(input_chunk.data(), bytes_read);
-
-        // 2. Classify
-        // We make a temporary vector for the classifier because it currently takes vector const&
-        // (Optimization: modify classifier to take span in the future to avoid this copy)
-        std::vector<uint8_t> classifier_input(input_chunk.begin(), input_chunk.begin() + bytes_read);
-        auto candidates = classifier.get_best_candidates(classifier_input);
-
-        // 3. Find Best Compressor
+        auto candidates = classifier.get_best_candidates(current_span);
         CompressorType best_type = CompressorType::NONE;
-        
-        // Default to "None" (store uncompressed) initially
         best_buffer.resize(bytes_read);
         std::copy(current_span.begin(), current_span.end(), best_buffer.begin());
         size_t best_size = bytes_read;
         bool compressed_successfully = false;
 
-        for (auto type : candidates) {
+        const size_t types_to_check = 1 + (level >= 4) + (level >= 7) + (level == 9) * (candidates.size() - 3);
+        for (size_t type_id = 0; type_id < types_to_check; ++type_id) {
+            auto type = candidates[type_id];
             size_t max_size = 0;
             size_t res_size = 0;
 
@@ -116,7 +107,7 @@ void Parallelizer::compress_file(const std::string& input_file, const std::strin
     }
 }
 
-void Parallelizer::decompress_file(const std::string& input_file, const std::string& output_file) {
+void Chunker::decompress_file(const std::string& input_file, const std::string& output_file) {
     std::ifstream in(input_file, std::ios::binary);
     if (!in) throw std::runtime_error("Cannot open input file: " + input_file);
 

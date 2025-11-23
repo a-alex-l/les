@@ -1,65 +1,22 @@
 #include "huffman_compressor.h"
+#include "common/entropy.h"
 #include <vector>
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <array>
 #include <numeric>
+#include <cstdint>
 #include <span>
 
 namespace {
 
-constexpr uint ILP = 4;
 constexpr int MAX_CODE_BITS = 15;
 constexpr int TABLE_BITS = 12;
 constexpr int TABLE_SIZE = 1 << TABLE_BITS;
 
-struct alignas(64) AlignedHistogram {
-    uint data[256];
-};
 
-std::array<uint, 256> count_symbols(std::span<const uint8_t> input)
-{
-    std::array<AlignedHistogram, ILP> streams;
-    for(auto& s : streams) std::fill(std::begin(s.data), std::end(s.data), 0);
-
-    const uint8_t* ptr = input.data();
-    size_t len = input.size();
-
-    while (len > 0 && (reinterpret_cast<uintptr_t>(ptr) & 7)) {
-        streams[0].data[*ptr]++;
-        ptr++;
-        len--;
-    }
-
-    auto run_batch = [&](auto seq) {
-        [ptr, &streams]<size_t... Is>(std::index_sequence<Is...>) __attribute__((always_inline)) {
-            ( (streams[Is].data[ptr[Is]]++), ... );
-        }(seq);
-    };
-
-    while (len >= ILP) {
-        run_batch(std::make_index_sequence<ILP>{});
-        ptr += ILP;
-        len -= ILP;
-    }
-
-    while (len > 0) {
-        streams[0].data[*ptr]++;
-        ptr++;
-        len--;
-    }
-
-    std::array<uint, 256> ans = {};
-    for (size_t s = 0; s < 256; ++s) {
-        uint sum = 0;
-        for (size_t i = 0; i < ILP; ++i) sum += streams[i].data[s];
-        ans[s] = sum;
-    }
-    return ans;
-}
-
-std::array<uint8_t, 256> find_lengths_15(const std::array<uint, 256>& counts)
+std::array<uint8_t, 256> find_lengths_15(const std::array<unsigned int, 256>& counts)
 {
     std::array<uint64_t, 512> freqs; 
     std::array<uint16_t, 512> parents; 

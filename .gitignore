@@ -1,6 +1,13 @@
-build
-data
-bench/venv
+build/
+build*/
+cmake-build-*/
+.cache
 .vscode
+.DS_Store
+*.swp
+data/
+bench/venv
 chart.png
 benchmark_results.csv
+*.user
+*.les

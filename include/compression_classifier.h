@@ -1,6 +1,7 @@
 #pragma once
 #include "compressor_types.h"
-#include <vector>
+#include <array>
+#include <span>
 #include <cstdint>
 
 class CompressionClassifier {
@@ -11,5 +12,5 @@ public:
      * @param data The input data chunk.
      * @return A vector of CompressorType enums, ordered from best to worst.
      */
-    std::vector<CompressorType> get_best_candidates(const std::vector<uint8_t>& data);
+    std::array<CompressorType, 3> get_best_candidates(std::span<const uint8_t> input);
 };

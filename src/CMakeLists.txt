@@ -3,7 +3,8 @@ set(LIB_SOURCES
     fse_compressor.cpp
     huffman_compressor.cpp
     lz_compressor.cpp
-    parallelizer.cpp
+    chunker.cpp
+    common/entropy.cpp
 )
 
 add_library(les_lib ${LIB_SOURCES})

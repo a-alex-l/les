@@ -1,13 +1,18 @@
 #include "compression_classifier.h"
+#include "common/entropy.h"
+#include <vector>
+#include <cmath>
+#include <algorithm>
 
-std::vector<CompressorType> CompressionClassifier::get_best_candidates(const std::vector<uint8_t>& data) {
-    // TODO: Implement real analysis (e.g., check for repetition for LZ,
-    // analyze symbol frequency for Huffman/FSE).
+std::array<CompressorType, 3> CompressionClassifier::get_best_candidates(std::span<const uint8_t> input) {
+    if (input.empty())
+        return {CompressorType::NONE, CompressorType::NONE, CompressorType::NONE};
 
-    // For now, return all available compressors to be tested.
-    return {
-        CompressorType::LZ,
-        CompressorType::FSE,
-        CompressorType::HUFFMAN
-    };
+    double entropy = get_entropy(input);
+
+    if (entropy < 6.5) {
+        return { CompressorType::LZ, CompressorType::HUFFMAN, CompressorType::FSE };
+    } else {
+        return { CompressorType::FSE, CompressorType::HUFFMAN, CompressorType::LZ };
+    }
 }

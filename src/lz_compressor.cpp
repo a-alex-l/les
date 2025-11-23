@@ -6,7 +6,6 @@
 #include <array>
 
 namespace {
-    // Must be power of 2 for bitwise optimization
     constexpr size_t WINDOW_SIZE = 4096; 
     constexpr size_t WINDOW_MASK = WINDOW_SIZE - 1;
     
@@ -16,10 +15,9 @@ namespace {
     constexpr size_t MIN_MATCH_LEN = 3;
     constexpr size_t MAX_MATCH_LEN = 18; // 3 + 15
 
-    // Inline helper for hashing to avoid function call overhead
     inline size_t get_hash(const uint8_t* p) {
-        // Simple XOR hash optimized for speed
-        return ((p[0] << 4) ^ (p[1] << 2) ^ p[2]) & HASH_MASK;
+        uint32_t val = (uint32_t(p[0])) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16);
+        return (val * 0x1e35a7bd) >> (32 - 12);
     }
 }
 

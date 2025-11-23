@@ -2,12 +2,12 @@
 
 #include <string>
 
-class Parallelizer {
+class Chunker {
 public:
     /**
      * @brief Default constructor.
      */
-    Parallelizer() = default;
+    Chunker() = default;
 
     /**
      * @brief Compresses a file sequentially (single-threaded).
