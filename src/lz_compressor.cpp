@@ -3,207 +3,225 @@
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
+#include <array>
 
 namespace {
-    // LZ77 Constants
-    constexpr size_t MIN_MATCH_LEN = 3;
-    constexpr size_t MAX_MATCH_LEN = 18; // 3 + 15 (4 bits)
-    // Increased Window/Hash size slightly for better real-world performance,
-    // but kept within reasonable memory limits.
+    // Must be power of 2 for bitwise optimization
     constexpr size_t WINDOW_SIZE = 4096; 
-    constexpr size_t HASH_SIZE = 4096; 
+    constexpr size_t WINDOW_MASK = WINDOW_SIZE - 1;
+    
+    constexpr size_t HASH_SIZE = 4096;
+    constexpr size_t HASH_MASK = HASH_SIZE - 1;
+    
+    constexpr size_t MIN_MATCH_LEN = 3;
+    constexpr size_t MAX_MATCH_LEN = 18; // 3 + 15
+
+    // Inline helper for hashing to avoid function call overhead
+    inline size_t get_hash(const uint8_t* p) {
+        // Simple XOR hash optimized for speed
+        return ((p[0] << 4) ^ (p[1] << 2) ^ p[2]) & HASH_MASK;
+    }
 }
 
 size_t LZCompressor::get_max_compressed_size(size_t input_size) const {
-    // Worst case: 1 control byte for every 8 literals + the literals themselves.
-    // + Header overhead (original size).
-    // + Safety margin.
+    // Header (8) + Body + Worst case overhead (~1/8th + padding)
     return input_size + (input_size / 8) + 64;
 }
 
 size_t LZCompressor::compress(std::span<const uint8_t> input, std::span<uint8_t> output, int level) {
     if (input.empty()) return 0;
+    
+    const size_t in_len = input.size();
+    const uint8_t* ip = input.data();
+    const uint8_t* const ip_end = ip + in_len;
+    const uint8_t* const ip_limit = ip_end - MIN_MATCH_LEN;
 
-    // 1. Configuration based on Level
-    // Level 1 -> 1 check
-    // Level 5 -> 16 checks
-    // Level 9 -> 256 checks
-    // This allows trading CPU time for finding better matches.
-    int max_chain_depth = (level <= 1) ? 1 : (1 << (level - 1));
-    if (max_chain_depth > 256) max_chain_depth = 256;
+    uint8_t* op = output.data();
+    uint8_t* const op_start = op;
+    uint8_t* const op_end = op + output.size();
 
-    std::vector<uint8_t> buffer;
-    // Reserve to prevent reallocations
-    buffer.reserve(input.size());
+    // 1. Write Header
+    if (output.size() < 8) throw std::runtime_error("Output buffer too small");
+    uint64_t size_header = static_cast<uint64_t>(in_len);
+    std::memcpy(op, &size_header, 8);
+    op += 8;
 
-    // 2. Write Original Size Header (8 bytes)
-    uint64_t original_size = input.size();
-    const uint8_t* size_ptr = reinterpret_cast<const uint8_t*>(&original_size);
-    buffer.insert(buffer.end(), size_ptr, size_ptr + 8);
+    // 2. Efficient Hash Tables (Allocated once)
+    // head stores the absolute position of the match
+    std::vector<int32_t> head(HASH_SIZE, -1);
+    // prev stores the previous position for the chain (Circular buffer based on window)
+    std::vector<int32_t> prev(WINDOW_SIZE, -1);
 
-    // 3. Initialize Hash Table and Chain
-    // head: maps hash -> index of most recent occurrence
-    // prev: maps index -> index of previous occurrence (linked list)
-    std::vector<int> head(HASH_SIZE, -1);
-    std::vector<int> prev(input.size(), -1);
+    // Chain depth limit based on level
+    // Level 0/1 = speed (1 check), Level 9 = max compression
+    uint32_t max_chain = (level <= 1) ? 1 : (1u << level);
+    if (max_chain > 256) max_chain = 256;
 
-    size_t ip = 0; // Input pointer
+    // 3. Processing Loop
+    // Buffers for the current group of 8 items
+    uint8_t token_buffer[32]; // Max size (8 * 2 bytes + safety)
+    int token_count = 0;
+    int token_buf_idx = 0;
+    uint8_t control_byte = 0;
 
-    // Temporary buffers for the Control Byte group
-    std::vector<uint8_t> token_buf;
-    token_buf.reserve(16);
-    std::vector<bool> flags; // false = literal, true = match
-    flags.reserve(8);
+    const uint8_t* anchor = ip; // Current processing position
 
-    // Helper to flush the group of 8 items
-    auto flush_tokens = [&](std::vector<uint8_t>& dest) {
-        if (flags.empty()) return;
-        
-        uint8_t control = 0;
-        for (size_t i = 0; i < flags.size(); ++i) {
-            if (flags[i]) control |= (1 << i);
-        }
-        dest.push_back(control);
-        dest.insert(dest.end(), token_buf.begin(), token_buf.end());
-        
-        token_buf.clear();
-        flags.clear();
-    };
-
-    while (ip < input.size()) {
+    while (anchor < ip_end) {
+        // Prepare to find a match
         size_t best_len = 0;
         size_t best_dist = 0;
 
-        // Only look for matches if enough bytes remain
-        if (ip + MIN_MATCH_LEN <= input.size()) {
-            // Simple Hash: XOR 3 bytes
-            uint16_t hash = ((input[ip] << 4) ^ (input[ip + 1] << 2) ^ input[ip + 2]) % HASH_SIZE;
+        // Only search if we have enough bytes and aren't at the very end
+        if (anchor < ip_limit) {
+            size_t hash = get_hash(anchor);
+            int32_t match_index = head[hash];
             
-            int match_index = head[hash];
-            
-            // Update Hash Chain
-            prev[ip] = match_index;
-            head[hash] = static_cast<int>(ip);
+            // Update Hash Tables
+            // Store previous match index in the circular buffer
+            prev[(anchor - input.data()) & WINDOW_MASK] = match_index;
+            head[hash] = static_cast<int32_t>(anchor - input.data());
 
-            // --- Chain Traversal (The "Level" Logic) ---
+            // Search the chain
             int chain_len = 0;
-            int current_match = match_index;
+            int32_t current_match = match_index;
+            size_t current_pos_idx = anchor - input.data();
 
-            while (current_match != -1 && chain_len < max_chain_depth) {
-                // Check distance
-                size_t dist = ip - current_match;
-                if (dist > WINDOW_SIZE) {
-                    break; // Match too far away, and chain is ordered by time, so others are further
-                }
+            while (current_match != -1 && chain_len < max_chain) {
+                size_t dist = current_pos_idx - current_match;
+                
+                // Distance must be valid (within window and non-zero)
+                if (dist > WINDOW_SIZE || dist == 0) break;
 
-                // Check if this match is actually useful
-                // (Optimization: check last byte first to fail fast)
-                if (input[current_match + best_len] == input[ip + best_len]) {
+                // Optimization: Check the match length only if first byte matches
+                const uint8_t* match_ptr = input.data() + current_match;
+                
+                if (anchor[best_len] == match_ptr[best_len]) { // Check byte at current best length first
                     size_t len = 0;
-                    while (len < MAX_MATCH_LEN && 
-                           (ip + len < input.size()) && 
-                           (input[ip + len] == input[current_match + len])) {
+                    // Bounded by max length and input end
+                    while (len < MAX_MATCH_LEN && (anchor + len < ip_end) && anchor[len] == match_ptr[len]) {
                         len++;
                     }
 
                     if (len > best_len && len >= MIN_MATCH_LEN) {
                         best_len = len;
                         best_dist = dist;
-                        
-                        // Heuristic: If we found the max possible length, stop searching.
-                        if (best_len == MAX_MATCH_LEN) break;
+                        if (best_len == MAX_MATCH_LEN) break; // Found max possible, stop searching
                     }
                 }
 
-                // Move to previous match in chain
-                current_match = prev[current_match];
+                // Move back in chain
+                current_match = prev[current_match & WINDOW_MASK];
                 chain_len++;
             }
         }
 
+        // Encode Logic
         if (best_len >= MIN_MATCH_LEN) {
-            // Encode Match
-            // [4 bits length-3] [12 bits offset]
-            uint16_t token = static_cast<uint16_t>(((best_len - MIN_MATCH_LEN) << 12) | (best_dist & 0xFFF));
-            token_buf.push_back(token & 0xFF);
-            token_buf.push_back((token >> 8) & 0xFF);
-            flags.push_back(true);
+            // MATCH FOUND
+            // Set bit in control byte (bits are filled LSB to MSB)
+            control_byte |= (1 << token_count);
             
-            // Advance input
-            // Note: We should technically update the hash chain for the skipped bytes 
-            // to maintain optimal compression, but for speed, we skip them here.
-            // (Updating them would make this LZ77 "Parse" complete but slower).
-            ip += best_len;
+            // Format: [4 bits len-3] [12 bits dist]
+            uint16_t token = static_cast<uint16_t>(((best_len - MIN_MATCH_LEN) << 12) | (best_dist & 0xFFF));
+            token_buffer[token_buf_idx++] = token & 0xFF;
+            token_buffer[token_buf_idx++] = (token >> 8) & 0xFF;
+
+            anchor += best_len;
+            
+            // Optional: Update hash for skipped bytes (omitted for speed, similar to LZ4)
+            // If you want max compression, you would loop and update hashes here.
         } else {
-            // Encode Literal
-            token_buf.push_back(input[ip]);
-            flags.push_back(false);
-            ip++;
+            // LITERAL
+            // Control bit is 0 (default), just write byte
+            token_buffer[token_buf_idx++] = *anchor;
+            anchor++;
         }
 
-        if (flags.size() == 8) {
-            flush_tokens(buffer);
+        token_count++;
+
+        // Flush group if full
+        if (token_count == 8) {
+            if (op + 1 + token_buf_idx > op_end) throw std::runtime_error("Output buffer too small");
+            
+            *op++ = control_byte;
+            std::memcpy(op, token_buffer, token_buf_idx);
+            op += token_buf_idx;
+
+            // Reset
+            control_byte = 0;
+            token_count = 0;
+            token_buf_idx = 0;
         }
     }
 
-    flush_tokens(buffer);
-
-    if (buffer.size() > output.size()) {
-        throw std::runtime_error("LZ Output buffer too small");
+    // Flush remaining tokens
+    if (token_count > 0) {
+        if (op + 1 + token_buf_idx > op_end) throw std::runtime_error("Output buffer too small");
+        *op++ = control_byte;
+        std::memcpy(op, token_buffer, token_buf_idx);
+        op += token_buf_idx;
     }
 
-    std::memcpy(output.data(), buffer.data(), buffer.size());
-    return buffer.size();
+    return op - op_start;
 }
 
 size_t LZCompressor::decompress(std::span<const uint8_t> input, std::span<uint8_t> output) {
     if (input.empty()) return 0;
 
-    size_t in_idx = 0;
-    size_t out_idx = 0;
+    const uint8_t* ip = input.data();
+    const uint8_t* ip_end = ip + input.size();
+    uint8_t* op = output.data();
+    uint8_t* op_start = op;
+    uint8_t* op_end = op + output.size();
 
     // 1. Read Original Size
-    if (input.size() < 8) throw std::runtime_error("LZ Input too small for header");
-    uint64_t original_size = *reinterpret_cast<const uint64_t*>(&input[in_idx]);
-    in_idx += 8;
+    if (input.size() < 8) throw std::runtime_error("Input too small");
+    uint64_t original_size;
+    std::memcpy(&original_size, ip, 8);
+    ip += 8;
 
-    if (output.size() < original_size) throw std::runtime_error("LZ Output buffer too small");
+    if (output.size() < original_size) throw std::runtime_error("Output buffer too small");
 
-    // 2. Decompress Stream
-    while (in_idx < input.size() && out_idx < original_size) {
-        uint8_t control = input[in_idx++];
+    // 2. Decompress
+    size_t bytes_decoded = 0;
+    
+    while (ip < ip_end && bytes_decoded < original_size) {
+        uint8_t control = *ip++;
         
-        for (int i = 0; i < 8 && out_idx < original_size; ++i) {
-            // Check if we ran out of input bits unexpectedly (allowed if last block matches exactly)
-            if (in_idx >= input.size() && (control >> i) != 0) break;
+        for (int i = 0; i < 8 && bytes_decoded < original_size; ++i) {
+            // Check for stream end early if bits suggest it
+            if (ip >= ip_end && (control >> i) == 0) break; 
 
-            bool is_match = (control >> i) & 1;
-
-            if (is_match) {
-                if (in_idx + 2 > input.size()) throw std::runtime_error("LZ Unexpected end of stream in match");
+            if ((control >> i) & 1) {
+                // Match
+                if (ip + 2 > ip_end) throw std::runtime_error("Unexpected EOF");
                 
-                uint16_t raw = input[in_idx] | (input[in_idx+1] << 8);
-                in_idx += 2;
+                uint16_t token = static_cast<uint16_t>(ip[0] | (ip[1] << 8));
+                ip += 2;
 
-                size_t len = (raw >> 12) + MIN_MATCH_LEN;
-                size_t dist = raw & 0xFFF;
+                size_t len = (token >> 12) + MIN_MATCH_LEN;
+                size_t dist = token & 0xFFF;
 
-                if (dist == 0 || dist > out_idx) {
-                     throw std::runtime_error("LZ Invalid back reference distance");
+                if (dist == 0 || dist > bytes_decoded) throw std::runtime_error("Invalid distance");
+
+                // Optimization: Tight copy loop
+                uint8_t* src = op - dist;
+                
+                // Overlap handling requires byte-by-byte or careful copy
+                // (Cannot use memcpy)
+                while(len--) {
+                    *op++ = *src++;
                 }
+                bytes_decoded = op - op_start;
 
-                // Copy memory (cannot use memcpy due to overlapping ranges logic in LZ)
-                size_t src_idx = out_idx - dist;
-                for (size_t l = 0; l < len; ++l) {
-                    if (out_idx >= output.size()) throw std::runtime_error("LZ Output overflow");
-                    output[out_idx++] = output[src_idx + l];
-                }
             } else {
-                if (in_idx >= input.size()) break; 
-                output[out_idx++] = input[in_idx++];
+                // Literal
+                if (ip >= ip_end) break;
+                *op++ = *ip++;
+                bytes_decoded++;
             }
         }
     }
 
-    return out_idx;
+    return bytes_decoded;
 }
