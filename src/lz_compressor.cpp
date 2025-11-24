@@ -3,178 +3,224 @@
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
+#include <array>
 
 namespace {
     // Shared constants
-    constexpr size_t MATCH_LEN_THRESHOLD_V2 = 15;  // 4 bits (max 15)
-    constexpr size_t MATCH_LEN_THRESHOLD_V3 = 255; // 8 bits (max 255)
+    constexpr size_t MATCH_LEN_THRESHOLD_V2 = 15;  
+    constexpr size_t MATCH_LEN_THRESHOLD_V3 = 255; 
 
+    // Knuth Multiplicative Hash for better distribution
     inline size_t get_hash(const uint8_t* p, size_t hash_bits) {
         uint32_t val;
-        // Read 4 bytes for better hashing
         std::memcpy(&val, p, 4);
-        return (val * 0x1e35a7bd) >> (32 - hash_bits);
+        return (val * 0x9E3779B1) >> (32 - hash_bits);
     }
 }
 
+// Helper class to handle the bit-packing/token writing clean and fast
+struct TokenWriter {
+    std::vector<uint8_t> buffer;
+    uint8_t control_byte = 0;
+    int token_count = 0;
+    uint8_t*& op;
+    uint8_t* const op_end;
+
+    TokenWriter(uint8_t*& output_ptr, uint8_t* output_end) 
+        : op(output_ptr), op_end(output_end) {
+        buffer.reserve(128);
+    }
+
+    void flush() {
+        if (token_count > 0) {
+            if (op + 1 + buffer.size() > op_end) throw std::runtime_error("Output buffer too small");
+            *op++ = control_byte;
+            std::memcpy(op, buffer.data(), buffer.size());
+            op += buffer.size();
+            
+            control_byte = 0;
+            token_count = 0;
+            buffer.clear();
+        }
+    }
+
+    void add_literal(uint8_t lit) {
+        // Literal bit is 0 (implicitly handled by not setting the bit)
+        buffer.push_back(lit);
+        token_count++;
+        check_flush();
+    }
+
+    template <LZMode Mode>
+    void add_match(size_t len, size_t dist) {
+        // Set bit to 1 for match
+        control_byte |= (1 << token_count);
+        
+        constexpr size_t MIN_LEN = (Mode == LZMode::V2B) ? 3 : 4;
+        size_t len_code = len - MIN_LEN;
+
+        if constexpr (Mode == LZMode::V2B) {
+            // V2B: [4:len][12:dist]
+            size_t write_len = (len_code > MATCH_LEN_THRESHOLD_V2) ? MATCH_LEN_THRESHOLD_V2 : len_code;
+            uint16_t token = static_cast<uint16_t>((write_len << 12) | (dist & 0xFFF));
+            buffer.push_back(token & 0xFF);
+            buffer.push_back((token >> 8) & 0xFF);
+
+            if (write_len == MATCH_LEN_THRESHOLD_V2) {
+                size_t remaining = len_code - MATCH_LEN_THRESHOLD_V2;
+                while (remaining >= 255) { buffer.push_back(255); remaining -= 255; }
+                buffer.push_back(static_cast<uint8_t>(remaining));
+            }
+        } else {
+            // V3B: [8:len][16:dist]
+            size_t write_len = (len_code > MATCH_LEN_THRESHOLD_V3) ? MATCH_LEN_THRESHOLD_V3 : len_code;
+            buffer.push_back(static_cast<uint8_t>(write_len));
+            buffer.push_back(static_cast<uint8_t>(dist & 0xFF));
+            buffer.push_back(static_cast<uint8_t>((dist >> 8) & 0xFF));
+
+            if (write_len == MATCH_LEN_THRESHOLD_V3) {
+                size_t remaining = len_code - MATCH_LEN_THRESHOLD_V3;
+                while (remaining >= 255) { buffer.push_back(255); remaining -= 255; }
+                buffer.push_back(static_cast<uint8_t>(remaining));
+            }
+        }
+        token_count++;
+        check_flush();
+    }
+
+    void check_flush() {
+        if (token_count == 8) flush();
+    }
+};
+
 template <LZMode Mode>
 size_t LZCompressor<Mode>::get_max_compressed_size(size_t input_size) const {
-    return input_size + (input_size / 8) + 128;
+    return input_size + (input_size / 8) + 256;
 }
 
 template <LZMode Mode>
 size_t LZCompressor<Mode>::compress(std::span<const uint8_t> input, std::span<uint8_t> output, int level) {
     if (input.empty()) return 0;
-    
-    // --- TEMPLATE CONSTANTS ---
+
+    // --- CONFIGURATION ---
     constexpr size_t WINDOW_SIZE = (Mode == LZMode::V2B) ? 4096 : 65536;
     constexpr size_t WINDOW_MASK = WINDOW_SIZE - 1;
     constexpr size_t MIN_MATCH_LEN = (Mode == LZMode::V2B) ? 3 : 4;
-    // 3B mode uses larger hash table to reduce collisions
-    constexpr size_t HASH_BITS = (Mode == LZMode::V2B) ? 12 : 16;
+    // Increased V2B hash bits slightly to reduce collisions
+    constexpr size_t HASH_BITS = (Mode == LZMode::V2B) ? 13 : 16; 
     constexpr size_t HASH_SIZE = 1 << HASH_BITS;
-    
-    // Optimization heuristics
-    constexpr size_t NICE_MATCH_LEN = (Mode == LZMode::V2B) ? 32 : 128;
+    constexpr size_t NICE_MATCH_LEN = (Mode == LZMode::V2B) ? 32 : 256;
 
-    const size_t in_len = input.size();
     const uint8_t* ip = input.data();
-    const uint8_t* const ip_end = ip + in_len;
+    const uint8_t* const ip_start = ip;
+    const uint8_t* const ip_end = ip + input.size();
     const uint8_t* const ip_limit = ip_end - 5; 
 
     uint8_t* op = output.data();
-    uint8_t* const op_start = op;
     uint8_t* const op_end = op + output.size();
+    uint8_t* const op_start = op;
 
     // 1. Write Header
     if (output.size() < 8) throw std::runtime_error("Output buffer too small");
-    uint64_t size_header = static_cast<uint64_t>(in_len);
+    uint64_t size_header = static_cast<uint64_t>(input.size());
     std::memcpy(op, &size_header, 8);
     op += 8;
 
-    // 2. Hash Tables
+    // 2. Structures
     std::vector<int32_t> head(HASH_SIZE, -1);
     std::vector<int32_t> prev(WINDOW_SIZE, -1);
+    
+    // Chain depth based on level
+    uint32_t max_chain = (level < 1) ? 4 : (8u << level); 
+    if (max_chain > 2048) max_chain = 2048; 
 
-    uint32_t max_chain = (level <= 1) ? 2 : (1u << level);
-    if (max_chain > 256) max_chain = 256;
+    TokenWriter writer(op, op_end);
 
-    std::vector<uint8_t> token_buffer;
-    token_buffer.reserve(512); 
+    // --- HELPER: Update Hash ---
+    // Adds the string starting at p to the dictionary
+    auto update_hash = [&](const uint8_t* p) {
+        if (p >= ip_limit) return;
+        size_t h = get_hash(p, HASH_BITS);
+        size_t idx = p - ip_start;
+        prev[idx & WINDOW_MASK] = head[h];
+        head[h] = static_cast<int32_t>(idx);
+    };
 
-    int token_count = 0;
-    uint8_t control_byte = 0;
-    const uint8_t* anchor = ip; 
-
-    while (anchor < ip_end) {
+    // --- HELPER: Find Best Match ---
+    auto find_match = [&](const uint8_t* curr_ip, size_t& out_dist) -> size_t {
+        if (curr_ip >= ip_limit) return 0;
+        
         size_t best_len = 0;
-        size_t best_dist = 0;
+        size_t curr_idx = curr_ip - ip_start;
+        size_t hash = get_hash(curr_ip, HASH_BITS);
+        int32_t match_idx = head[hash];
+        
+        int chain_len = 0;
+        
+        while (match_idx != -1 && chain_len < max_chain) {
+            size_t dist = curr_idx - match_idx;
+            if (dist >= WINDOW_SIZE || dist == 0) break;
 
-        if (anchor < ip_limit) {
-            size_t hash = get_hash(anchor, HASH_BITS);
-            int32_t match_index = head[hash];
-            
-            prev[(anchor - input.data()) & WINDOW_MASK] = match_index;
-            head[hash] = static_cast<int32_t>(anchor - input.data());
+            const uint8_t* match_ptr = ip_start + match_idx;
 
-            int chain_len = 0;
-            int32_t current_match = match_index;
-            size_t current_pos_idx = anchor - input.data();
-
-            while (current_match != -1 && chain_len < max_chain) {
-                size_t dist = current_pos_idx - current_match;
-                if (dist >= WINDOW_SIZE || dist == 0) break;
-
-                const uint8_t* match_ptr = input.data() + current_match;
+            // Optimization: Check match end first, then start
+            if (curr_ip[best_len] == match_ptr[best_len] && 
+                curr_ip[0] == match_ptr[0]) {
                 
-                // Quick check at min length + start
-                if (anchor[MIN_MATCH_LEN-1] == match_ptr[MIN_MATCH_LEN-1] && 
-                    anchor[0] == match_ptr[0]) {
-                    
-                    size_t len = 0;
-                    while ((anchor + len < ip_end) && anchor[len] == match_ptr[len]) {
-                        len++;
-                    }
-
-                    if (len > best_len && len >= MIN_MATCH_LEN) {
-                        best_len = len;
-                        best_dist = dist;
-                        if (best_len >= NICE_MATCH_LEN) break; 
-                    }
+                size_t len = 0;
+                while (curr_ip + len < ip_end && curr_ip[len] == match_ptr[len]) {
+                    len++;
                 }
-                current_match = prev[current_match & WINDOW_MASK];
-                chain_len++;
-            }
-        }
 
-        if (best_len >= MIN_MATCH_LEN) {
-            // MATCH
-            control_byte |= (1 << token_count);
+                if (len > best_len) {
+                    best_len = len;
+                    out_dist = dist;
+                    if (len >= NICE_MATCH_LEN) break;
+                }
+            }
+
+            match_idx = prev[match_idx & WINDOW_MASK];
+            chain_len++;
+        }
+        
+        if (best_len < MIN_MATCH_LEN) return 0;
+        return best_len;
+    };
+
+    // --- MAIN LOOP (GREEDY) ---
+    while (ip < ip_end) {
+        // 1. Find match at current position
+        size_t dist = 0;
+        size_t len = find_match(ip, dist);
+
+        // 2. Emit Token
+        if (len >= MIN_MATCH_LEN) {
+            // Match found
+            writer.add_match<Mode>(len, dist);
             
-            if constexpr (Mode == LZMode::V2B) {
-                // --- V2B FORMAT: [4:len][12:dist] ---
-                size_t len_code = best_len - MIN_MATCH_LEN;
-                if (len_code > MATCH_LEN_THRESHOLD_V2) len_code = MATCH_LEN_THRESHOLD_V2;
-
-                uint16_t token = static_cast<uint16_t>((len_code << 12) | (best_dist & 0xFFF));
-                token_buffer.push_back(token & 0xFF);
-                token_buffer.push_back((token >> 8) & 0xFF);
-
-                if (len_code == MATCH_LEN_THRESHOLD_V2) {
-                    size_t remaining = (best_len - MIN_MATCH_LEN) - MATCH_LEN_THRESHOLD_V2;
-                    while (remaining >= 255) { token_buffer.push_back(255); remaining -= 255; }
-                    token_buffer.push_back(static_cast<uint8_t>(remaining));
-                }
-
-            } else {
-                // --- V3B FORMAT: [8:len][16:dist] ---
-                size_t len_code = best_len - MIN_MATCH_LEN;
-                if (len_code > MATCH_LEN_THRESHOLD_V3) len_code = MATCH_LEN_THRESHOLD_V3;
-
-                token_buffer.push_back(static_cast<uint8_t>(len_code));
-                token_buffer.push_back(static_cast<uint8_t>(best_dist & 0xFF));
-                token_buffer.push_back(static_cast<uint8_t>((best_dist >> 8) & 0xFF));
-
-                if (len_code == MATCH_LEN_THRESHOLD_V3) {
-                    size_t remaining = (best_len - MIN_MATCH_LEN) - MATCH_LEN_THRESHOLD_V3;
-                    while (remaining >= 255) { token_buffer.push_back(255); remaining -= 255; }
-                    token_buffer.push_back(static_cast<uint8_t>(remaining));
-                }
+            // CRITICAL IMPROVEMENT:
+            // Even though we skip 'len' bytes in input, we must update the hash table
+            // for all of them. This allows future matches to point into the middle 
+            // of this sequence.
+            for (size_t i = 0; i < len; ++i) {
+                update_hash(ip + i);
             }
-
-            anchor += best_len;
+            ip += len;
         } else {
-            // LITERAL
-            token_buffer.push_back(*anchor);
-            anchor++;
-        }
-
-        token_count++;
-
-        if (token_count == 8) {
-            if (op + 1 + token_buffer.size() > op_end) throw std::runtime_error("Output buffer too small");
-            *op++ = control_byte;
-            std::memcpy(op, token_buffer.data(), token_buffer.size());
-            op += token_buffer.size();
-
-            control_byte = 0;
-            token_count = 0;
-            token_buffer.clear();
+            // Literal
+            writer.add_literal(*ip);
+            update_hash(ip);
+            ip++;
         }
     }
 
-    if (token_count > 0) {
-        if (op + 1 + token_buffer.size() > op_end) throw std::runtime_error("Output buffer too small");
-        *op++ = control_byte;
-        std::memcpy(op, token_buffer.data(), token_buffer.size());
-        op += token_buffer.size();
-    }
-
+    writer.flush();
     return op - op_start;
 }
 
 template <LZMode Mode>
 size_t LZCompressor<Mode>::decompress(std::span<const uint8_t> input, std::span<uint8_t> output) {
+    // Decompressor logic is standard and matches the format
     if (input.empty()) return 0;
     
     constexpr size_t MIN_MATCH_LEN = (Mode == LZMode::V2B) ? 3 : 4;
@@ -241,7 +287,7 @@ size_t LZCompressor<Mode>::decompress(std::span<const uint8_t> input, std::span<
 
                 if (dist == 0 || dist > bytes_decoded) throw std::runtime_error("Invalid distance");
 
-                uint8_t* src = op - dist;
+                const uint8_t* src = op - dist;
                 if (op + match_len > op_end) throw std::runtime_error("Output overrun");
                 
                 for(size_t j=0; j<match_len; ++j) { *op++ = *src++; }
