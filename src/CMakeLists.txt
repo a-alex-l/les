@@ -1,7 +1,6 @@
 set(LIB_SOURCES
     compression_classifier.cpp
     fse_compressor.cpp
-    huffman_compressor.cpp
     lz_compressor.cpp
     fuzzy_lz_compressor.cpp
     chunker.cpp
