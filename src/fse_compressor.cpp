@@ -172,7 +172,7 @@ size_t FSECompressor::decompress(std::span<const uint8_t> input, std::span<uint8
     std::memcpy(&original_size, &input[in_idx], 8);
     in_idx += 8;
 
-    if (output.size() < original_size) throw std::runtime_error("FSE Output buffer too small");
+    if (output.size() < original_size) throw std::runtime_error("FSE Output buffer is smaller than actual output");
 
     // 2. Table Reconstruction
     if (input.size() < in_idx + 1024) throw std::runtime_error("FSE Input too small for table");
