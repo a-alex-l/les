@@ -4,12 +4,12 @@
 #include <cmath>
 #include <algorithm>
 
-std::array<CompressorType, 4> CompressionClassifier::get_best_candidates(
+std::array<CompressorType, 6> CompressionClassifier::get_best_candidates(
     std::span<const uint8_t> input, 
     std::span<uint8_t> delta_buffer) 
 {
     if (input.empty())
-        return {CompressorType::NONE, CompressorType::NONE, CompressorType::NONE, CompressorType::NONE};
+        return {CompressorType::NONE};
 
     uint8_t prev = 0;
     const size_t len = input.size();
@@ -23,15 +23,15 @@ std::array<CompressorType, 4> CompressionClassifier::get_best_candidates(
 
     // Delta is usually a strong indicator of structure
     if (delta_entropy < raw_entropy - 0.5) { 
-        return { CompressorType::DELTA_FSE, CompressorType::LZ_3B, CompressorType::LZ_2B, CompressorType::FSE };
+        return { CompressorType::DELTA_FSE, CompressorType::FUZZY_LZ_3B, CompressorType::LZ_3B, CompressorType::LZ_2B, CompressorType::FSE, CompressorType::HUFFMAN};
     }
     
     if (raw_entropy < 6.0) {
         // Low entropy/Structured
         // LZ_3B is usually safer for mixed data, but we can try LZ_2B if we want speed/small data
-        return { CompressorType::LZ_3B, CompressorType::LZ_2B, CompressorType::FSE, CompressorType::HUFFMAN };
+        return { CompressorType::LZ_3B, CompressorType::LZ_2B, CompressorType::FUZZY_LZ_3B, CompressorType::FSE, CompressorType::DELTA_FSE, CompressorType::HUFFMAN };
     } else {
         // High entropy
-        return { CompressorType::FSE, CompressorType::LZ_3B, CompressorType::LZ_2B, CompressorType::HUFFMAN };
+        return { CompressorType::FSE, CompressorType::DELTA_FSE, CompressorType::FUZZY_LZ_3B, CompressorType::LZ_3B, CompressorType::LZ_2B, CompressorType::HUFFMAN };
     }
 }

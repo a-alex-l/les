@@ -3,6 +3,7 @@ set(LIB_SOURCES
     fse_compressor.cpp
     huffman_compressor.cpp
     lz_compressor.cpp
+    fuzzy_lz_compressor.cpp
     chunker.cpp
     common/entropy.cpp
 )
@@ -10,6 +11,7 @@ set(LIB_SOURCES
 add_library(les_lib ${LIB_SOURCES})
 
 target_link_libraries(les_lib PRIVATE Threads::Threads)
+target_compile_options(les_lib PRIVATE -msse4.2 -mpopcnt)
 
 target_include_directories(les_lib PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>

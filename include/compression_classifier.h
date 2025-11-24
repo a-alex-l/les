@@ -14,7 +14,7 @@ public:
      *                     The classifier WILL write the delta-transformed data here.
      * @return Ranked list of compression strategies.
      */
-    std::array<CompressorType, 4> get_best_candidates(
+    std::array<CompressorType, 6> get_best_candidates(
         std::span<const uint8_t> input, 
         std::span<uint8_t> delta_buffer
     );

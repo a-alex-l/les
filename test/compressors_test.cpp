@@ -2,6 +2,7 @@
 #include "huffman_compressor.h"
 #include "fse_compressor.h"
 #include "lz_compressor.h"
+#include "fuzzy_lz_compressor.h"
 #include <string>
 #include <vector>
 #include <numeric>
@@ -133,6 +134,7 @@ using CompressorTypes = ::testing::Types<
     HuffmanCompressor,
     FSECompressor,
     LZCompressor<LZMode::V2B>,
-    LZCompressor<LZMode::V3B>
+    LZCompressor<LZMode::V3B>,
+    FuzzyLZCompressor
 >;
 INSTANTIATE_TYPED_TEST_SUITE_P(AllCompressors, CompressorTest, CompressorTypes);

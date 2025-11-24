@@ -4,6 +4,7 @@
 #include "huffman_compressor.h"
 #include "fse_compressor.h"
 #include "lz_compressor.h"
+#include "fuzzy_lz_compressor.h"
 
 #include <fstream>
 #include <vector>
@@ -72,6 +73,11 @@ void Chunker::compress_file(const std::string& input_file, const std::string& ou
                     max_size = c.get_max_compressed_size(bytes_read); 
                     break; 
                 }
+                case CompressorType::FUZZY_LZ_3B: { 
+                    FuzzyLZCompressor c; 
+                    max_size = c.get_max_compressed_size(bytes_read); 
+                    break; 
+                }
                 case CompressorType::FSE:
                 case CompressorType::DELTA_FSE: {
                     FSECompressor c;
@@ -108,6 +114,11 @@ void Chunker::compress_file(const std::string& input_file, const std::string& ou
                     }
                     case CompressorType::DELTA_FSE: {
                         FSECompressor c;
+                        res_size = c.compress(delta_span, compression_buffer, level);
+                        break;
+                    }
+                    case CompressorType::FUZZY_LZ_3B: {
+                        FuzzyLZCompressor c;
                         res_size = c.compress(delta_span, compression_buffer, level);
                         break;
                     }
@@ -187,6 +198,11 @@ void Chunker::decompress_file(const std::string& input_file, const std::string& 
             }
             case CompressorType::LZ_3B: {
                 LZCompressor<LZMode::V3B> c;
+                c.decompress(src_span, dst_span);
+                break;
+            }
+            case CompressorType::FUZZY_LZ_3B: {
+                FuzzyLZCompressor c;
                 c.decompress(src_span, dst_span);
                 break;
             }

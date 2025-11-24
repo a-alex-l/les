@@ -7,4 +7,5 @@ enum class CompressorType : int {
     LZ_3B = 3,
     FSE = 4,
     DELTA_FSE = 5,
+    FUZZY_LZ_3B = 6,
 };
