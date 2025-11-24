@@ -1,341 +1,296 @@
 #include "fuzzy_lz_compressor.h"
-#include "huffman_compressor.h"
 #include "fse_compressor.h"
 
 #include <vector>
 #include <cstring>
 #include <algorithm>
 #include <stdexcept>
-#include <immintrin.h> // For SSE/AVX
+#include <cmath>
+#include <bit> 
 
-namespace {
-
-// --- Configuration ---
-constexpr int MIN_MATCH = 16;
-constexpr int MAX_DIST = 65535;       
-constexpr int HASH_BITS = 15;         
-constexpr int HASH_SIZE = 1 << HASH_BITS;
-constexpr int MAX_DIFFS = 3;          // REDUCED: Stricter error tolerance (was 4)
-constexpr int MAX_MATCH_LEN = 126;    // SAFE LIMIT
-
-// --- SIMD Helpers ---
-#if defined(__GNUC__) || defined(__clang__)
-    #define TARGET_SIMD __attribute__((target("sse4.2,popcnt")))
+// Fallback for popcount
+#if __cplusplus < 202002L
+    #ifdef _MSC_VER
+        #include <intrin.h>
+        inline int count_set_bits(uint8_t v) { return __popcnt16(v); }
+    #else
+        inline int count_set_bits(uint8_t v) { return __builtin_popcount(v); }
+    #endif
 #else
-    #define TARGET_SIMD
+    inline int count_set_bits(uint8_t v) { return std::popcount(v); }
 #endif
 
-// Load 16 bytes unaligned
-TARGET_SIMD
-inline __m128i load128(const uint8_t* p) {
-    return _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
-}
+namespace {
+    // FuzzyLZ Constants
+    constexpr int THRESH_D = 2;
+    constexpr int THRESH_X = 1;
+    constexpr size_t MAX_SHIFT = 65535;
 
-// 64-bit Hash Multiplier (Knuth)
-inline uint32_t hash_func(uint64_t val) {
-    return (uint32_t)((val * 11400714819323198485llu) >> (64 - HASH_BITS));
-}
+    enum MatchType : uint8_t {
+        TYPE_LITERAL = 0,
+        TYPE_EXACT   = 1,
+        TYPE_DIFF    = 2,
+        TYPE_XOR     = 3
+    };
 
-// Split 16 bytes into Even/Odd 64-bit integers
-TARGET_SIMD
-inline void split_even_odd(__m128i val, uint64_t& even, uint64_t& odd) {
-    const __m128i mask = _mm_setr_epi8(
-        0, 2, 4, 6, 8, 10, 12, 14,
-        1, 3, 5, 7, 9, 11, 13, 15
-    );
-    __m128i shuffled = _mm_shuffle_epi8(val, mask);
-    even = (uint64_t)_mm_cvtsi128_si64(shuffled);
-    odd = (uint64_t)_mm_extract_epi64(shuffled, 1);
-}
+    // Rolling Hash
+    constexpr uint32_t HASH_MUL = 0x1e35a7bd;
+    constexpr int HASH_LOG = 16;
+    constexpr int HASH_SIZE = 1 << HASH_LOG;
 
-// Calculate Hamming Distance (Population Count of XOR)
-TARGET_SIMD
-inline int get_pop_diff(__m128i a, __m128i b) {
-    __m128i x = _mm_xor_si128(a, b);
-    uint64_t v0 = (uint64_t)_mm_cvtsi128_si64(x);
-    uint64_t v1 = (uint64_t)_mm_extract_epi64(x, 1);
-    return (int)(_mm_popcnt_u64(v0) + _mm_popcnt_u64(v1));
-}
+    inline uint32_t hash_func(uint32_t val) {
+        return (val * HASH_MUL) >> (32 - HASH_LOG);
+    }
 
-} // namespace
+    // Byte Reading Helpers
+    inline uint32_t read32_le(const uint8_t* ptr) {
+        return ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | (ptr[3] << 24);
+    }
+
+    inline void write32_le(uint8_t* ptr, uint32_t val) {
+        ptr[0] = val & 0xFF;
+        ptr[1] = (val >> 8) & 0xFF;
+        ptr[2] = (val >> 16) & 0xFF;
+        ptr[3] = (val >> 24) & 0xFF;
+    }
+
+    inline uint64_t read64_le(const uint8_t* ptr) {
+        uint64_t val;
+        std::memcpy(&val, ptr, 8);
+        return val;
+    }
+}
 
 size_t FuzzyLZCompressor::get_max_compressed_size(size_t input_size) const {
-    HuffmanCompressor huff;
     FSECompressor fse;
-    return huff.get_max_compressed_size(input_size) + fse.get_max_compressed_size(input_size / 8) + 64;
+    // Overhead: 6 streams * (~1050 bytes FSE header) + Framing + Margin
+    return input_size + (6 * 1050) + 4096;
 }
 
-TARGET_SIMD
 size_t FuzzyLZCompressor::compress(std::span<const uint8_t> input, std::span<uint8_t> output, int level) {
-    const size_t input_size = input.size();
-    if (input_size == 0) return 0;
+    const uint8_t* data = input.data();
+    size_t len = input.size();
+    size_t i = 0;
 
-    const uint8_t* src = input.data();
-    size_t ip = 0;
-    size_t anchor = 0;
+    // Stream Buffers
+    std::vector<uint8_t> s_type;     s_type.reserve(len / 4);
+    std::vector<uint8_t> s_len;      s_len.reserve(len / 8);
+    std::vector<uint8_t> s_shift_lo; s_shift_lo.reserve(len / 8);
+    std::vector<uint8_t> s_shift_hi; s_shift_hi.reserve(len / 8);
+    std::vector<uint8_t> s_lit;      s_lit.reserve(len / 2);
+    std::vector<uint8_t> s_fuzzy;    s_fuzzy.reserve(len / 8);
 
-    std::vector<uint8_t> main_stream;
-    std::vector<uint8_t> delta_stream;
-    main_stream.reserve(input_size);
-    delta_stream.reserve(input_size / 16);
+    std::vector<uint32_t> hash_table(HASH_SIZE, 0);
+    std::vector<bool> hash_valid(HASH_SIZE, false);
 
-    std::vector<int> table_even(HASH_SIZE, -1);
-    std::vector<int> table_odd(HASH_SIZE, -1);
+    while (i < len) {
+        if (i + 4 > len) {
+            s_type.push_back(TYPE_LITERAL);
+            s_lit.push_back(data[i]);
+            i++;
+            continue;
+        }
 
-    if (input_size >= MIN_MATCH) {
-        while (ip < input_size - MIN_MATCH) {
-            __m128i val_curr = load128(src + ip);
-            uint64_t u_even, u_odd;
-            split_even_odd(val_curr, u_even, u_odd);
+        uint32_t sequence = read32_le(data + i);
+        uint32_t h = hash_func(sequence);
+        
+        size_t ref = hash_table[h];
+        bool valid = hash_valid[h];
+        
+        hash_table[h] = static_cast<uint32_t>(i);
+        hash_valid[h] = true;
 
-            uint32_t h_even = hash_func(u_even);
-            uint32_t h_odd = hash_func(u_odd);
-
-            int ref_e = table_even[h_even];
-            int ref_o = table_odd[h_odd];
-            
-            table_even[h_even] = (int)ip;
-            table_odd[h_odd] = (int)ip;
-
-            int best_ref = -1;
-            int min_cost = MAX_DIFFS + 1;
-
-            if (ref_e != -1) {
-                size_t dist = ip - (size_t)ref_e;
-                if (dist < MAX_DIST) {
-                    __m128i val_ref = load128(src + ref_e);
-                    int cost = get_pop_diff(val_curr, val_ref);
-                    if (cost < min_cost) {
-                        min_cost = cost;
-                        best_ref = ref_e;
-                    }
-                }
+        bool match_found = false;
+        if (valid && (i > ref) && ((i - ref) <= MAX_SHIFT)) {
+            if (read32_le(data + ref) == sequence) {
+                match_found = true;
             }
+        }
 
-            if (min_cost > 0 && ref_o != -1 && ref_o != ref_e) {
-                size_t dist = ip - (size_t)ref_o;
-                if (dist < MAX_DIST) {
-                    __m128i val_ref = load128(src + ref_o);
-                    int cost = get_pop_diff(val_curr, val_ref);
-                    if (cost < min_cost) {
-                        min_cost = cost;
-                        best_ref = ref_o;
-                    }
-                }
-            }
+        if (!match_found) {
+            s_type.push_back(TYPE_LITERAL);
+            s_lit.push_back(data[i]);
+            i++;
+            continue;
+        }
 
-            if (best_ref != -1) {
-                // A. Emit Literals
-                size_t lit_len = ip - anchor;
-                while (lit_len > 0) {
-                    size_t chunk = std::min(lit_len, (size_t)127);
-                    if (chunk == 127) main_stream.push_back(0x7F);
-                    else main_stream.push_back((uint8_t)chunk);
-                    main_stream.insert(main_stream.end(), src + anchor, src + anchor + chunk);
-                    anchor += chunk;
-                    lit_len -= chunk;
-                }
+        // Anchor
+        size_t l_anc = 0;
+        while ((i + l_anc < len) && (data[i + l_anc] == data[ref + l_anc])) {
+            l_anc++;
+        }
 
-                // B. Extend Match
-                size_t curr = ip;
-                size_t ref = best_ref;
-                std::vector<uint8_t> diff_indices;
-                std::vector<uint8_t> diff_values;
-                
-                while (curr < input_size && (curr - ip) < MAX_MATCH_LEN) {
-                    uint8_t s = src[curr];
-                    uint8_t r = src[ref];
-                    
-                    if (s != r) {
-                        if (diff_indices.size() >= MAX_DIFFS) break;
-                        diff_indices.push_back((uint8_t)(curr - ip));
-                        diff_values.push_back(s ^ r);
-                    }
-                    curr++; ref++;
-                }
-                size_t match_len = curr - ip;
-                
-                if (match_len < 4) { ip++; continue; }
+        // Diff
+        size_t l_diff = 0;
+        while (i + l_anc + l_diff < len) {
+            int delta = std::abs(static_cast<int>(data[i + l_anc + l_diff]) - static_cast<int>(data[ref + l_anc + l_diff]));
+            if (delta > THRESH_D) break;
+            l_diff++;
+        }
 
-                // C. Emit Token
-                main_stream.push_back((uint8_t)(0x80 | match_len));
-                uint16_t off = (uint16_t)(ip - best_ref);
-                main_stream.push_back(off & 0xFF);
-                main_stream.push_back(off >> 8);
+        // Xor
+        size_t l_xor = 0;
+        while (i + l_anc + l_xor < len) {
+            uint8_t val = data[i + l_anc + l_xor] ^ data[ref + l_anc + l_xor];
+            int bits = count_set_bits(val);
+            if (bits > THRESH_X) break;
+            l_xor++;
+        }
 
-                main_stream.push_back((uint8_t)diff_indices.size());
-                for(auto idx : diff_indices) main_stream.push_back(idx);
-                for(auto val : diff_values) delta_stream.push_back(val);
+        // Decision
+        size_t total_len = l_anc;
+        MatchType mode = TYPE_EXACT;
 
-                ip += match_len;
-                anchor = ip;
+        if (l_diff > 0 || l_xor > 0) {
+            if (l_diff >= l_xor) {
+                mode = TYPE_DIFF;
+                total_len += l_diff;
             } else {
-                ip++;
-            }
-        }
-    }
-
-    // Finish Literals
-    size_t lit_len = input_size - anchor;
-    while (lit_len > 0) {
-        size_t chunk = std::min(lit_len, (size_t)127);
-        if (chunk == 127) main_stream.push_back(0x7F);
-        else main_stream.push_back((uint8_t)chunk);
-        main_stream.insert(main_stream.end(), src + anchor, src + anchor + chunk);
-        anchor += chunk;
-        lit_len -= chunk;
-    }
-
-    // --- Final Encoding ---
-    uint8_t* out_ptr = output.data();
-    size_t out_max = output.size();
-    size_t current_pos = 16; 
-
-    if (out_max < current_pos) throw std::runtime_error("Buffer too small for header");
-
-    uint64_t total_orig = input_size;
-    std::memcpy(out_ptr, &total_orig, 8);
-
-    // 1. Huffman (Main Stream)
-    HuffmanCompressor huff;
-    size_t h_size = huff.compress(main_stream, output.subspan(current_pos), 0);
-    std::memcpy(out_ptr + 8, &h_size, 4);
-    current_pos += h_size;
-
-    // 2. Delta Stream (Raw or FSE)
-    // We use the MSB of the size field to indicate "Raw Copy"
-    if (!delta_stream.empty()) {
-        bool use_raw = true;
-        size_t f_size = 0;
-
-        // Try FSE only if stream is large enough
-        if (delta_stream.size() >= 64) {
-            FSECompressor fse;
-            // Compress into temp buffer to verify size
-            std::vector<uint8_t> temp_buf(fse.get_max_compressed_size(delta_stream.size()));
-            f_size = fse.compress(delta_stream, temp_buf, 0);
-            
-            if (f_size > 0 && f_size < delta_stream.size()) {
-                // FSE Successful
-                if (current_pos + f_size > out_max) throw std::runtime_error("Buffer overflow");
-                std::memcpy(output.data() + current_pos, temp_buf.data(), f_size);
-                
-                uint32_t flag = (uint32_t)f_size; // MSB 0
-                std::memcpy(out_ptr + 12, &flag, 4);
-                current_pos += f_size;
-                use_raw = false;
+                mode = TYPE_XOR;
+                total_len += l_xor;
             }
         }
 
-        if (use_raw) {
-            // Raw Copy
-            if (current_pos + delta_stream.size() > out_max) throw std::runtime_error("Buffer overflow");
-            std::memcpy(output.data() + current_pos, delta_stream.data(), delta_stream.size());
-            
-            uint32_t raw_len = (uint32_t)delta_stream.size();
-            uint32_t flag = raw_len | 0x80000000; // Set MSB 1
-            std::memcpy(out_ptr + 12, &flag, 4);
-            current_pos += raw_len;
+        if (total_len < 3) {
+            s_type.push_back(TYPE_LITERAL);
+            s_lit.push_back(data[i]);
+            i++;
+        } else {
+            s_type.push_back(mode);
+
+            // Length encoding
+            size_t store_len = total_len - 3;
+            while (store_len >= 255) {
+                s_len.push_back(255);
+                store_len -= 255;
+            }
+            s_len.push_back(static_cast<uint8_t>(store_len));
+
+            // Shift encoding
+            size_t shift = i - ref;
+            s_shift_lo.push_back(shift & 0xFF);
+            s_shift_hi.push_back((shift >> 8) & 0xFF);
+
+            // Fuzzy data for WHOLE match
+            if (mode == TYPE_DIFF) {
+                for (size_t k = 0; k < total_len; ++k)
+                    s_fuzzy.push_back(static_cast<uint8_t>(data[i + k] - data[ref + k]));
+            } else if (mode == TYPE_XOR) {
+                for (size_t k = 0; k < total_len; ++k)
+                    s_fuzzy.push_back(data[i + k] ^ data[ref + k]);
+            }
+            i += total_len;
         }
-    } else {
-        uint32_t zero = 0;
-        std::memcpy(out_ptr + 12, &zero, 4);
     }
 
-    return current_pos;
+    FSECompressor fse;
+    uint8_t* op = output.data();
+    const uint8_t* oend = output.data() + output.size();
+
+    auto compress_stream = [&](const std::vector<uint8_t>& src) {
+        if (op + 4 > oend) throw std::runtime_error("Buffer full");
+        uint8_t* hdr = op; op += 4;
+        
+        size_t sz = 0;
+        if (!src.empty()) {
+            if (op >= oend) throw std::runtime_error("Buffer full");
+            sz = fse.compress(src, std::span<uint8_t>(op, oend - op), level);
+        }
+        write32_le(hdr, static_cast<uint32_t>(sz));
+        op += sz;
+    };
+
+    compress_stream(s_type);
+    compress_stream(s_len);
+    compress_stream(s_shift_lo);
+    compress_stream(s_shift_hi);
+    compress_stream(s_lit);
+    compress_stream(s_fuzzy);
+
+    return static_cast<size_t>(op - output.data());
 }
 
 size_t FuzzyLZCompressor::decompress(std::span<const uint8_t> input, std::span<uint8_t> output) {
-    if (input.empty()) return 0;
-    if (input.size() < 16) throw std::runtime_error("Header too small");
+    FSECompressor fse;
+    const uint8_t* ip = input.data();
+    const uint8_t* iend = input.data() + input.size();
 
-    const uint8_t* in_ptr = input.data();
-    uint64_t total_orig;
-    uint32_t h_size, f_size_flag;
-
-    std::memcpy(&total_orig, in_ptr, 8);
-    std::memcpy(&h_size, in_ptr + 8, 4);
-    std::memcpy(&f_size_flag, in_ptr + 12, 4);
-
-    if (output.size() < total_orig) throw std::runtime_error("Output buffer too small");
-
-    // Decode Huffman (Main Stream)
-    std::vector<uint8_t> main_stream(total_orig + 4096); 
-    HuffmanCompressor huff;
-    size_t main_len = 0;
-    
-    if (h_size > 0) {
-        main_len = huff.decompress(input.subspan(16, h_size), main_stream);
-        main_stream.resize(main_len);
-    }
-
-    // Decode Delta Stream
-    std::vector<uint8_t> delta_stream; 
-    
-    bool is_raw_delta = (f_size_flag & 0x80000000) != 0;
-    uint32_t f_size = f_size_flag & 0x7FFFFFFF;
-
-    if (f_size > 0) {
-        if (is_raw_delta) {
-             delta_stream.resize(f_size);
-             if (16 + h_size + f_size > input.size()) throw std::runtime_error("Input truncated");
-             std::memcpy(delta_stream.data(), input.data() + 16 + h_size, f_size);
-        } else {
-             delta_stream.resize(total_orig); // Max possible size
-             FSECompressor fse;
-             size_t d_len = fse.decompress(input.subspan(16 + h_size, f_size), delta_stream);
-             delta_stream.resize(d_len);
-        }
-    }
-    
-    size_t mp = 0; 
-    size_t dp = 0; 
-    size_t op = 0; 
-    uint8_t* dst = output.data();
-
-    while (op < total_orig && mp < main_stream.size()) {
-        uint8_t token = main_stream[mp++];
+    auto decompress_stream = [&](std::vector<uint8_t>& dest) {
+        if (ip + 4 > iend) throw std::runtime_error("Missing frame header");
+        uint32_t csize = read32_le(ip);
+        ip += 4;
+        if (csize == 0) { dest.clear(); return; }
         
-        if ((token & 0x80) == 0) {
-            // Literal
-            int len = token;
-            if (len == 0) continue; 
-            if (op + len > total_orig) throw std::runtime_error("Literal overflow");
-            if (mp + len > main_stream.size()) throw std::runtime_error("Main stream underflow");
-            
-            std::memcpy(dst + op, main_stream.data() + mp, len);
-            mp += len;
-            op += len;
-        } 
-        else {
-            // Match
-            int len = token & 0x7F;
-            if (len == 0) len = 127; 
-            
-            if (mp + 3 > main_stream.size()) throw std::runtime_error("Main stream underflow (meta)");
-            
-            uint16_t off = main_stream[mp++];
-            off |= (uint16_t)main_stream[mp++] << 8;
-            uint8_t diff_count = main_stream[mp++];
-            
-            if (op < off) throw std::runtime_error("Invalid offset");
-            const uint8_t* ref_ptr = dst + op - off;
-            
-            for (int i = 0; i < len; ++i) dst[op + i] = ref_ptr[i];
+        if (ip + csize > iend) throw std::runtime_error("Stream truncated");
+        
+        // Peek Uncompressed Size from FSE Header
+        if (csize < 8) throw std::runtime_error("FSE blob too small");
+        uint64_t usize = read64_le(ip);
+        
+        if (usize > 1024ULL * 1024 * 1024 * 2) throw std::runtime_error("Stream too large"); // Sanity limit 2GB
+        
+        dest.resize(static_cast<size_t>(usize));
+        
+        size_t w = fse.decompress(std::span<const uint8_t>(ip, csize), std::span<uint8_t>(dest));
+        if (w != usize) throw std::runtime_error("Size mismatch");
+        ip += csize;
+    };
 
-            if (mp + diff_count > main_stream.size()) throw std::runtime_error("Main stream underflow (idx)");
-            if (dp + diff_count > delta_stream.size()) throw std::runtime_error("Delta stream underflow");
+    std::vector<uint8_t> s_type, s_len, s_shift_lo, s_shift_hi, s_lit, s_fuzzy;
+    
+    decompress_stream(s_type);
+    decompress_stream(s_len);
+    decompress_stream(s_shift_lo);
+    decompress_stream(s_shift_hi);
+    decompress_stream(s_lit);
+    decompress_stream(s_fuzzy);
 
-            for (int i = 0; i < diff_count; ++i) {
-                uint8_t idx = main_stream[mp++];
-                uint8_t xor_val = delta_stream[dp++];
-                if (idx >= len) throw std::runtime_error("Diff index out of bounds");
-                dst[op + idx] ^= xor_val;
+    size_t out_pos = 0;
+    size_t out_cap = output.size();
+    uint8_t* out_buf = output.data();
+
+    size_t p_len = 0, p_slo = 0, p_shi = 0, p_lit = 0, p_fuz = 0;
+
+    for (uint8_t type : s_type) {
+        if (out_pos >= out_cap) break; 
+
+        if (type == TYPE_LITERAL) {
+            if (p_lit >= s_lit.size()) throw std::runtime_error("Stream underrun: Lit");
+            out_buf[out_pos++] = s_lit[p_lit++];
+        } else {
+            // Reconstruct Match
+            size_t match_len = 0;
+            while (p_len < s_len.size()) {
+                uint8_t v = s_len[p_len++];
+                match_len += v;
+                if (v < 255) break;
             }
+            match_len += 3;
 
-            op += len;
+            if (p_slo >= s_shift_lo.size() || p_shi >= s_shift_hi.size()) 
+                throw std::runtime_error("Stream underrun: Shift");
+            
+            size_t shift = s_shift_lo[p_slo++] | (static_cast<size_t>(s_shift_hi[p_shi++]) << 8);
+            if (shift == 0 || shift > out_pos) throw std::runtime_error("Invalid shift");
+            
+            size_t ref_pos = out_pos - shift;
+            if (out_pos + match_len > out_cap) throw std::runtime_error("Output overflow");
+
+            if (type == TYPE_EXACT) {
+                // Handle Overlap for LZ
+                for (size_t k = 0; k < match_len; ++k)
+                    out_buf[out_pos++] = out_buf[ref_pos + k];
+            } else if (type == TYPE_DIFF) {
+                if (p_fuz + match_len > s_fuzzy.size()) throw std::runtime_error("Stream underrun: Fuzzy");
+                for (size_t k = 0; k < match_len; ++k)
+                    out_buf[out_pos++] = out_buf[ref_pos + k] + s_fuzzy[p_fuz++];
+            } else if (type == TYPE_XOR) {
+                if (p_fuz + match_len > s_fuzzy.size()) throw std::runtime_error("Stream underrun: Fuzzy");
+                for (size_t k = 0; k < match_len; ++k)
+                    out_buf[out_pos++] = out_buf[ref_pos + k] ^ s_fuzzy[p_fuz++];
+            }
         }
     }
 
-    return total_orig;
+    return out_pos;
 }

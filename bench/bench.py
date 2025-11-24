@@ -144,7 +144,7 @@ def main():
         "lz4": {
             "exe": "lz4",
             "ext": ".lz4",
-            "levels": range(1, 10, 2), # 1 to 9
+            "levels": [1, 2] + list(range(3, 10, 2)), # 1 to 9
             "compress_cmd": lambda exe, lvl, inp, out: [exe, "-f", f"-{lvl}", inp, out],
             "decompress_cmd": lambda exe, inp, out: [exe, "-d", "-f", inp, out],
             "use_stdout": False
