@@ -58,7 +58,6 @@ template <typename T> struct ScratchVector {
     if (count < data.size()) {
       data[count++] = val;
     } else {
-      // Logic error fallback: overwrite last byte to prevent heap corruption
       if (!data.empty())
         data[data.size() - 1] = val;
     }
@@ -129,8 +128,8 @@ struct StreamSplitter {
 
 template <LZMode Mode>
 size_t LZCompressor<Mode>::get_max_compressed_size(size_t input_size) const {
-  // Theoretical max + headers + large safety padding
-  return input_size + (input_size / 8) + 8192;
+  // Increased safety margin for output buffer
+  return input_size + (input_size / 8) + 65536;
 }
 
 template <LZMode Mode>
@@ -139,28 +138,22 @@ LZCompressor<Mode>::get_compression_scratch_size(size_t input_size) const {
   constexpr size_t HASH_SIZE = 1 << 16;
   constexpr size_t WINDOW_SIZE = 65536;
 
-  // 1. Calculate space needed for LZ vectors
   size_t vec_overhead = 0;
   vec_overhead += align4(max_controls_size(input_size));
   vec_overhead += align4(max_literals_size(input_size));
   vec_overhead += align4(max_lengths_size(input_size));
   vec_overhead += align4(max_offsets_size(input_size));
 
-  // 2. Calculate space for the "Reuse Area" (Memory shared between LZ Tables
-  // and FSE Scratch) We must reserve enough space for whichever is larger to
-  // avoid FSE overwriting the vectors later.
   size_t lz_tables_size = (HASH_SIZE * 4) + (WINDOW_SIZE * 4);
 
   FSECompressor fse;
-  // FSE needs scratch proportional to the data it compresses (worst case:
-  // literals buffer)
-  size_t fse_scratch_needed =
-      fse.get_compression_scratch_size(max_literals_size(input_size));
+  size_t fse_scratch_needed = fse.get_compression_scratch_size(max_literals_size(input_size));
 
-  size_t reserved_reuse_area =
-      align4(std::max(lz_tables_size, fse_scratch_needed));
+  size_t reserved_reuse_area = align4(std::max(lz_tables_size, fse_scratch_needed));
 
-  return reserved_reuse_area + vec_overhead + 8192;
+  // FIX: Massive safety margin (64KB) for scratch allocator
+  // This prevents std::bad_alloc if alignment padding shifts slightly
+  return reserved_reuse_area + vec_overhead + 65536;
 }
 
 template <LZMode Mode>
@@ -191,37 +184,24 @@ size_t LZCompressor<Mode>::compress(std::span<const uint8_t> input,
   constexpr size_t HASH_SIZE = 1 << HASH_BITS;
   constexpr size_t NICE_MATCH_LEN = 256;
 
-  // Keep a pointer to the start of scratch for the FSE reuse later
   uint8_t *const scratch_base = scratch.data();
-  const size_t scratch_total_size = scratch.size();
 
-  // --- 1. Memory Layout Setup ---
-  // Recalculate the reserved area size to match get_compression_scratch_size
-  // exactly
   FSECompressor fse;
   size_t lz_tables_size = (HASH_SIZE * 4) + (WINDOW_SIZE * 4);
-  size_t fse_scratch_needed =
-      fse.get_compression_scratch_size(max_literals_size(input.size()));
-  size_t reserved_reuse_area =
-      align4(std::max(lz_tables_size, fse_scratch_needed));
+  size_t fse_scratch_needed = fse.get_compression_scratch_size(max_literals_size(input.size()));
+  size_t reserved_reuse_area = align4(std::max(lz_tables_size, fse_scratch_needed));
 
   if (scratch.size() < reserved_reuse_area)
     throw std::runtime_error("Scratch buffer too small for reuse area");
 
-  // Setup LZ Tables in the first part of the reserved area
-  auto head_span =
-      ScratchVector<int32_t>(scratch, HASH_SIZE); // advances 'scratch'
-  auto prev_span =
-      ScratchVector<int32_t>(scratch, WINDOW_SIZE); // advances 'scratch'
+  auto head_span = ScratchVector<int32_t>(scratch, HASH_SIZE);
+  auto prev_span = ScratchVector<int32_t>(scratch, WINDOW_SIZE);
   int32_t *head = head_span.data.data();
   int32_t *prev = prev_span.data.data();
 
   std::fill(head_span.data.begin(), head_span.data.end(), -1);
   std::fill(prev_span.data.begin(), prev_span.data.end(), -1);
 
-  // SKIP PADDING!
-  // We must skip any remaining bytes in the reserved area so that 'streams'
-  // starts strictly AFTER 'reserved_reuse_area'.
   size_t used_so_far = scratch.data() - scratch_base;
   if (reserved_reuse_area > used_so_far) {
     size_t padding = reserved_reuse_area - used_so_far;
@@ -230,10 +210,8 @@ size_t LZCompressor<Mode>::compress(std::span<const uint8_t> input,
     scratch = scratch.subspan(padding);
   }
 
-  // --- 2. Stream Splitting ---
   StreamSplitter streams(scratch, input.size());
 
-  // --- 3. LZ Compression Loop ---
   const uint8_t *ip = input.data();
   const uint8_t *const ip_start = ip;
   const uint8_t *const ip_end = ip + input.size();
@@ -298,7 +276,6 @@ size_t LZCompressor<Mode>::compress(std::span<const uint8_t> input,
   }
   streams.finish();
 
-  // --- 4. Output Writing ---
   uint8_t *op = output.data();
   uint8_t *const op_end = op + output.size();
 
@@ -313,10 +290,6 @@ size_t LZCompressor<Mode>::compress(std::span<const uint8_t> input,
   uint8_t *size_ptr = op;
   op += 16;
 
-  // --- 5. FSE Compression (Reusing Scratch) ---
-  // We reuse the ENTIRE reserved area at the start.
-  // Since we enforced that 'streams' starts after 'reserved_reuse_area',
-  // FSE can use the whole reserved area without touching 'streams'.
   std::span<uint8_t> fse_reuse_scratch(scratch_base, reserved_reuse_area);
 
   auto compress_stream = [&](std::span<uint8_t> src, uint8_t *&dest, int idx) {
@@ -329,6 +302,7 @@ size_t LZCompressor<Mode>::compress(std::span<const uint8_t> input,
       throw std::runtime_error("Output buffer exhausted");
 
     size_t remaining = op_end - dest;
+    // Safety check for FSE header space
     if (remaining < 64)
       throw std::runtime_error("Output buffer exhausted before FSE stream");
 
@@ -380,16 +354,10 @@ size_t LZCompressor<Mode>::decompress(std::span<const uint8_t> input,
 
   FSECompressor fse;
 
-  // Decompression scratch management is simpler: we allocate buffers first,
-  // then whatever remains is given to FSE.
-  auto buf_ctrl =
-      ScratchVector<uint8_t>(scratch, max_controls_size(original_size));
-  auto buf_lit =
-      ScratchVector<uint8_t>(scratch, max_literals_size(original_size));
-  auto buf_len =
-      ScratchVector<uint8_t>(scratch, max_lengths_size(original_size));
-  auto buf_off =
-      ScratchVector<uint8_t>(scratch, max_offsets_size(original_size));
+  auto buf_ctrl = ScratchVector<uint8_t>(scratch, max_controls_size(original_size));
+  auto buf_lit = ScratchVector<uint8_t>(scratch, max_literals_size(original_size));
+  auto buf_len = ScratchVector<uint8_t>(scratch, max_lengths_size(original_size));
+  auto buf_off = ScratchVector<uint8_t>(scratch, max_offsets_size(original_size));
 
   auto decompress_stream = [&](size_t comp_sz, ScratchVector<uint8_t> &dest) {
     if (comp_sz == 0)
@@ -397,7 +365,6 @@ size_t LZCompressor<Mode>::decompress(std::span<const uint8_t> input,
     if (ip + comp_sz > ip_end)
       throw std::runtime_error("Truncated FSE stream");
 
-    // Pass the remaining scratch to FSE
     size_t written = fse.decompress(std::span<const uint8_t>(ip, comp_sz),
                                     dest.data, scratch);
 
@@ -424,7 +391,6 @@ size_t LZCompressor<Mode>::decompress(std::span<const uint8_t> input,
     uint8_t control = buf_ctrl.data[c];
     for (int i = 0; i < 8 && bytes_decoded < original_size; ++i) {
       if ((control >> i) & 1) {
-        // Match
         if (len_idx >= buf_len.count)
           throw std::runtime_error("Len buffer underflow");
 
@@ -458,7 +424,6 @@ size_t LZCompressor<Mode>::decompress(std::span<const uint8_t> input,
           *op++ = *src++;
         bytes_decoded += match_len;
       } else {
-        // Literal
         if (lit_idx >= buf_lit.count)
           throw std::runtime_error("Lit buffer underflow");
 

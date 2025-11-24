@@ -20,21 +20,27 @@ CompressionClassifier::get_best_candidates(std::span<const uint8_t> input,
   double raw_entropy = get_entropy(input);
   double delta_entropy = get_entropy(delta_buffer);
 
-  // Delta is usually a strong indicator of structure
+  // Delta is strong for numeric/sensor data
   if (delta_entropy < raw_entropy - 0.5) {
     return {CompressorType::DELTA_FSE, CompressorType::FUZZY_LZ_3B,
             CompressorType::LZ_3B, CompressorType::LZ_2B, CompressorType::FSE};
   }
 
-  if (raw_entropy < 6.0) {
-    // Low entropy/Structured
-    // LZ_3B is usually safer for mixed data, but we can try LZ_2B if we want
-    // speed/small data
-    return {CompressorType::LZ_3B, CompressorType::LZ_2B,
-            CompressorType::FUZZY_LZ_3B, CompressorType::FSE,
+  // Refined Logic:
+  // Source code/Text usually has entropy 4.5 - 6.5.
+  // Binaries/Encrypted data have entropy > 7.5.
+  // LZ is usually superior for anything structured, even if entropy is somewhat high.
+  // We only deprioritize LZ if entropy is extremely high (indicating randomness).
+
+  if (raw_entropy < 7.5) {
+    // Structured Data (Text, Code, Binaries, JSON, XML)
+    // LZ_3B is the robust default. FuzzyLZ finds near-matches.
+    return {CompressorType::LZ_3B, CompressorType::FUZZY_LZ_3B,
+            CompressorType::LZ_2B, CompressorType::FSE,
             CompressorType::DELTA_FSE};
   } else {
-    // High entropy
+    // High Randomness (Compressed data, Encrypted, High Entropy Noise)
+    // FSE is the best bet to squeeze remaining bits.
     return {CompressorType::FSE, CompressorType::DELTA_FSE,
             CompressorType::FUZZY_LZ_3B, CompressorType::LZ_3B,
             CompressorType::LZ_2B};
