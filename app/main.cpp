@@ -5,7 +5,7 @@
 #include <vector>
 
 int main(int argc, char *argv[]) {
-  cxxopts::Options options("les", "A fast, parallel compression "
+  cxxopts::Options options("les", "A fast, single threaded compression "
                                   "utility.\nDefault action is decompression.");
 
   options.add_options()
@@ -69,7 +69,7 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
-    Chunker parallelizer;
+    Chunker chunker;
 
     if (compress_mode) {
       int level = result["compress"].as<int>();
@@ -105,12 +105,12 @@ int main(int argc, char *argv[]) {
       std::cout << "Compressing '" << input_file << "' to '" << output_file
                 << "' with Level " << level << "..." << std::endl;
 
-      parallelizer.compress_file(input_file, output_file, level);
+      chunker.compress_file(input_file, output_file, level);
       std::cout << "Compression finished successfully." << std::endl;
     } else {
       std::cout << "Decompressing '" << input_file << "' to '" << output_file
                 << "'..." << std::endl;
-      parallelizer.decompress_file(input_file, output_file);
+      chunker.decompress_file(input_file, output_file);
       std::cout << "Decompression finished successfully." << std::endl;
     }
 
