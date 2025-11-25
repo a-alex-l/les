@@ -31,7 +31,7 @@ public:
   /**
    * @brief Compresses data from a source span to a destination span.
    * Automatically splits input into 128KB blocks for optimal entropy context.
-   * 
+   *
    * @param input A span viewing the uncompressed data.
    * @param output A span viewing the buffer where compressed data will be
    * written.
@@ -46,7 +46,7 @@ public:
   /**
    * @brief Decompresses data from a source span to a destination span.
    * Handles multiple internal blocks automatically.
-   * 
+   *
    * @param input A span viewing the compressed data.
    * @param output A span viewing the buffer for the decompressed data.
    * @param scratch A span viewing the where tmp data would be stored.

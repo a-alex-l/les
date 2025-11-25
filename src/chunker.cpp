@@ -11,18 +11,21 @@
 #include <vector>
 
 namespace {
-  size_t get_chunk_size_for_level(int level) {
-    if (level > 9)
-      level = 9;
-    int shift = 15 + level;
-    return 1ULL << shift;
-  }
+size_t get_chunk_size_for_level(int level) {
+  if (level > 9)
+    level = 9;
+  int shift = 15 + level;
+  return 1ULL << shift;
+}
 
 int get_trials_for_level(int level) {
-  if (level <= 2) return 1; // Trust the classifier
-  if (level <= 3) return 2; // Check top 2
-  if (level <= 7) return 3; // Check top 3 (Covers FSE vs LZ ambiguity)
-  return 5;                 // Check all
+  if (level <= 2)
+    return 1; // Trust the classifier
+  if (level <= 3)
+    return 2; // Check top 2
+  if (level <= 7)
+    return 3; // Check top 3 (Covers FSE vs LZ ambiguity)
+  return 5;   // Check all
 }
 } // namespace
 
@@ -53,7 +56,7 @@ void Chunker::compress_file(const std::string &input_file,
 
     std::span<const uint8_t> raw_span(input_chunk.data(), bytes_read);
     std::span<uint8_t> delta_span(delta_buffer.data(), bytes_read);
-    
+
     auto candidates = classifier.get_best_candidates(raw_span, delta_span);
 
     // Default to uncompressed
@@ -66,7 +69,8 @@ void Chunker::compress_file(const std::string &input_file,
 
     for (int t = 0; t < trials; ++t) {
       CompressorType type = candidates[t];
-      if (type == CompressorType::NONE) continue;
+      if (type == CompressorType::NONE)
+        continue;
 
       size_t max_size = 0;
       size_t scratch_sz = 0;
@@ -79,24 +83,33 @@ void Chunker::compress_file(const std::string &input_file,
 
       switch (type) {
       case CompressorType::LZ_2B: {
-        LZCompressor<LZMode::V2B> c; setup(c); break;
+        LZCompressor<LZMode::V2B> c;
+        setup(c);
+        break;
       }
       case CompressorType::LZ_3B: {
-        LZCompressor<LZMode::V3B> c; setup(c); break;
+        LZCompressor<LZMode::V3B> c;
+        setup(c);
+        break;
       }
       case CompressorType::FUZZY_LZ_3B: {
-        FuzzyLZCompressor c; setup(c); break;
+        FuzzyLZCompressor c;
+        setup(c);
+        break;
       }
       case CompressorType::FSE:
       case CompressorType::DELTA_FSE: {
-        FSECompressor c; setup(c); break;
+        FSECompressor c;
+        setup(c);
+        break;
       }
-      default: continue;
+      default:
+        continue;
       }
 
       if (compression_buffer.size() < max_size)
         compression_buffer.resize(max_size);
-      
+
       // Ensure scratch is large enough
       if (scratch_buffer.size() < scratch_sz)
         scratch_buffer.resize(scratch_sz);
@@ -106,30 +119,36 @@ void Chunker::compress_file(const std::string &input_file,
         switch (type) {
         case CompressorType::FSE: {
           FSECompressor c;
-          res_size = c.compress(raw_span, compression_buffer, scratch_span, level);
+          res_size =
+              c.compress(raw_span, compression_buffer, scratch_span, level);
           break;
         }
         case CompressorType::LZ_2B: {
           LZCompressor<LZMode::V2B> c;
-          res_size = c.compress(raw_span, compression_buffer, scratch_span, level);
+          res_size =
+              c.compress(raw_span, compression_buffer, scratch_span, level);
           break;
         }
         case CompressorType::LZ_3B: {
           LZCompressor<LZMode::V3B> c;
-          res_size = c.compress(raw_span, compression_buffer, scratch_span, level);
+          res_size =
+              c.compress(raw_span, compression_buffer, scratch_span, level);
           break;
         }
         case CompressorType::DELTA_FSE: {
           FSECompressor c;
-          res_size = c.compress(delta_span, compression_buffer, scratch_span, level);
+          res_size =
+              c.compress(delta_span, compression_buffer, scratch_span, level);
           break;
         }
         case CompressorType::FUZZY_LZ_3B: {
           FuzzyLZCompressor c;
-          res_size = c.compress(delta_span, compression_buffer, scratch_span, level);
+          res_size =
+              c.compress(delta_span, compression_buffer, scratch_span, level);
           break;
         }
-        default: break;
+        default:
+          break;
         }
 
         if (res_size > 0 && res_size < best_size) {

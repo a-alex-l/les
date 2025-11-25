@@ -29,8 +29,9 @@ CompressionClassifier::get_best_candidates(std::span<const uint8_t> input,
   // Refined Logic:
   // Source code/Text usually has entropy 4.5 - 6.5.
   // Binaries/Encrypted data have entropy > 7.5.
-  // LZ is usually superior for anything structured, even if entropy is somewhat high.
-  // We only deprioritize LZ if entropy is extremely high (indicating randomness).
+  // LZ is usually superior for anything structured, even if entropy is somewhat
+  // high. We only deprioritize LZ if entropy is extremely high (indicating
+  // randomness).
 
   if (raw_entropy < 7.5) {
     // Structured Data (Text, Code, Binaries, JSON, XML)

@@ -1,4 +1,5 @@
 #include "lz_compressor.h"
+#include "common/span_allocator.h"
 #include "fse_compressor.h"
 #include <algorithm>
 #include <array>
@@ -8,7 +9,9 @@
 #include <vector>
 
 namespace {
+
 constexpr size_t MATCH_LEN_THRESHOLD = 255;
+constexpr size_t ALLOC_PADDING = 64; // span_allocator.h uses std::align(64, ...)
 
 inline size_t get_hash(const uint8_t *p, size_t hash_bits) {
   uint32_t val;
@@ -16,9 +19,12 @@ inline size_t get_hash(const uint8_t *p, size_t hash_bits) {
   return (val * 0x9E3779B1) >> (32 - hash_bits);
 }
 
-// --- Theoretical Maximum Calculators ---
+// --- Size Calculators ---
 
-static constexpr size_t align4(size_t size) { return (size + 3) & ~3; }
+// Helper to estimate allocation consumption including alignment padding
+static constexpr size_t estimate_alloc_size(size_t bytes) {
+  return bytes + ALLOC_PADDING;
+}
 
 static constexpr size_t max_controls_size(size_t input_size) {
   return (input_size + 7) / 8 + 64;
@@ -36,75 +42,54 @@ static constexpr size_t max_offsets_size(size_t input_size) {
   return ((input_size / 3) * 2) + 64;
 }
 
-// Bump allocator helper
-template <typename T> struct ScratchVector {
-  std::span<T> data;
-  size_t count = 0;
-
-  ScratchVector() = default;
-  ScratchVector(std::span<uint8_t> &mem, size_t capacity) {
-    size_t bytes = capacity * sizeof(T);
-    size_t padding = (4 - (bytes % 4)) % 4;
-    size_t total_bytes = bytes + padding;
-
-    if (mem.size() < total_bytes)
-      throw std::bad_alloc();
-
-    data = std::span<T>(reinterpret_cast<T *>(mem.data()), capacity);
-    mem = mem.subspan(total_bytes);
-  }
-
-  void push_back(T val) {
-    if (count < data.size()) {
-      data[count++] = val;
-    } else {
-      if (!data.empty())
-        data[data.size() - 1] = val;
-    }
-  }
-
-  std::span<T> filled() { return data.subspan(0, count); }
-  bool empty() const { return count == 0; }
-  void clear() { count = 0; }
-};
-
 struct StreamSplitter {
-  ScratchVector<uint8_t> controls;
-  ScratchVector<uint8_t> literals;
-  ScratchVector<uint8_t> lengths;
-  ScratchVector<uint8_t> offsets;
+  std::span<uint8_t> controls;
+  std::span<uint8_t> literals;
+  std::span<uint8_t> lengths;
+  std::span<uint8_t> offsets;
+
+  size_t idx_controls = 0;
+  size_t idx_literals = 0;
+  size_t idx_lengths = 0;
+  size_t idx_offsets = 0;
 
   uint8_t current_control = 0;
   int token_count = 0;
 
   StreamSplitter(std::span<uint8_t> &scratch, size_t input_size) {
-    controls = ScratchVector<uint8_t>(scratch, max_controls_size(input_size));
-    literals = ScratchVector<uint8_t>(scratch, max_literals_size(input_size));
-    lengths = ScratchVector<uint8_t>(scratch, max_lengths_size(input_size));
-    offsets = ScratchVector<uint8_t>(scratch, max_offsets_size(input_size));
+    controls = alloc_span<uint8_t>(scratch, max_controls_size(input_size));
+    literals = alloc_span<uint8_t>(scratch, max_literals_size(input_size));
+    lengths  = alloc_span<uint8_t>(scratch, max_lengths_size(input_size));
+    offsets  = alloc_span<uint8_t>(scratch, max_offsets_size(input_size));
   }
 
   void add_literal(uint8_t lit) {
-    literals.push_back(lit);
+    if (idx_literals < literals.size()) {
+      literals[idx_literals++] = lit;
+    }
     next_token();
   }
 
   void add_match(size_t len, size_t dist, size_t min_match_len) {
     current_control |= (1 << token_count);
     size_t len_code = len - min_match_len;
+    
     if (len_code >= MATCH_LEN_THRESHOLD) {
-      lengths.push_back(255);
+      if (idx_lengths < lengths.size()) lengths[idx_lengths++] = 255;
       size_t remaining = len_code - MATCH_LEN_THRESHOLD;
       while (remaining >= 255) {
-        lengths.push_back(255);
+        if (idx_lengths < lengths.size()) lengths[idx_lengths++] = 255;
         remaining -= 255;
       }
-      lengths.push_back(static_cast<uint8_t>(remaining));
+      if (idx_lengths < lengths.size()) lengths[idx_lengths++] = static_cast<uint8_t>(remaining);
     } else {
-      lengths.push_back(static_cast<uint8_t>(len_code));
+      if (idx_lengths < lengths.size()) lengths[idx_lengths++] = static_cast<uint8_t>(len_code);
     }
-    offsets.push_back(static_cast<uint8_t>(dist & 0xFF));
-    offsets.push_back(static_cast<uint8_t>((dist >> 8) & 0xFF));
+    
+    if (idx_offsets + 1 < offsets.size()) {
+      offsets[idx_offsets++] = static_cast<uint8_t>(dist & 0xFF);
+      offsets[idx_offsets++] = static_cast<uint8_t>((dist >> 8) & 0xFF);
+    }
     next_token();
   }
 
@@ -116,11 +101,14 @@ struct StreamSplitter {
 
   void flush_control() {
     if (token_count > 0) {
-      controls.push_back(current_control);
+      if (idx_controls < controls.size()) {
+        controls[idx_controls++] = current_control;
+      }
       current_control = 0;
       token_count = 0;
     }
   }
+  
   void finish() { flush_control(); }
 };
 
@@ -128,7 +116,6 @@ struct StreamSplitter {
 
 template <LZMode Mode>
 size_t LZCompressor<Mode>::get_max_compressed_size(size_t input_size) const {
-  // Increased safety margin for output buffer
   return input_size + (input_size / 8) + 65536;
 }
 
@@ -138,36 +125,40 @@ LZCompressor<Mode>::get_compression_scratch_size(size_t input_size) const {
   constexpr size_t HASH_SIZE = 1 << 16;
   constexpr size_t WINDOW_SIZE = 65536;
 
-  size_t vec_overhead = 0;
-  vec_overhead += align4(max_controls_size(input_size));
-  vec_overhead += align4(max_literals_size(input_size));
-  vec_overhead += align4(max_lengths_size(input_size));
-  vec_overhead += align4(max_offsets_size(input_size));
+  // Space for LZ Tables
+  size_t lz_tables = 0;
+  lz_tables += estimate_alloc_size(HASH_SIZE * sizeof(int32_t));
+  lz_tables += estimate_alloc_size(WINDOW_SIZE * sizeof(int32_t));
 
-  size_t lz_tables_size = (HASH_SIZE * 4) + (WINDOW_SIZE * 4);
+  // Space for Splitter Vectors
+  size_t vectors = 0;
+  vectors += estimate_alloc_size(max_controls_size(input_size));
+  vectors += estimate_alloc_size(max_literals_size(input_size));
+  vectors += estimate_alloc_size(max_lengths_size(input_size));
+  vectors += estimate_alloc_size(max_offsets_size(input_size));
 
+  // Space for FSE scratch
   FSECompressor fse;
-  size_t fse_scratch_needed = fse.get_compression_scratch_size(max_literals_size(input_size));
+  size_t fse_scratch =
+      fse.get_compression_scratch_size(max_literals_size(input_size));
 
-  size_t reserved_reuse_area = align4(std::max(lz_tables_size, fse_scratch_needed));
+  // Memory Layout: [Reuse Area (LZ Tables | FSE Scratch)] [Vectors]
+  size_t reuse_area = std::max(lz_tables, fse_scratch);
 
-  // FIX: Massive safety margin (64KB) for scratch allocator
-  // This prevents std::bad_alloc if alignment padding shifts slightly
-  return reserved_reuse_area + vec_overhead + 65536;
+  return reuse_area + vectors + 4096; // 4KB Safety margin
 }
 
 template <LZMode Mode>
 size_t
 LZCompressor<Mode>::get_decompression_scratch_size(size_t output_size) const {
-  size_t sz_ctrl = align4(max_controls_size(output_size));
-  size_t sz_lit = align4(max_literals_size(output_size));
-  size_t sz_len = align4(max_lengths_size(output_size));
-  size_t sz_off = align4(max_offsets_size(output_size));
-
-  size_t vec_overhead = sz_ctrl + sz_lit + sz_len + sz_off;
+  size_t vectors = 0;
+  vectors += estimate_alloc_size(max_controls_size(output_size));
+  vectors += estimate_alloc_size(max_literals_size(output_size));
+  vectors += estimate_alloc_size(max_lengths_size(output_size));
+  vectors += estimate_alloc_size(max_offsets_size(output_size));
 
   FSECompressor fse;
-  return vec_overhead + fse.get_decompression_scratch_size(output_size) + 8192;
+  return vectors + fse.get_decompression_scratch_size(output_size) + 4096;
 }
 
 template <LZMode Mode>
@@ -184,33 +175,25 @@ size_t LZCompressor<Mode>::compress(std::span<const uint8_t> input,
   constexpr size_t HASH_SIZE = 1 << HASH_BITS;
   constexpr size_t NICE_MATCH_LEN = 256;
 
-  uint8_t *const scratch_base = scratch.data();
+  uint8_t* const scratch_base = scratch.data();
 
-  FSECompressor fse;
-  size_t lz_tables_size = (HASH_SIZE * 4) + (WINDOW_SIZE * 4);
-  size_t fse_scratch_needed = fse.get_compression_scratch_size(max_literals_size(input.size()));
-  size_t reserved_reuse_area = align4(std::max(lz_tables_size, fse_scratch_needed));
+  // --- Allocate LZ Tables (Reuse Area) ---
+  auto head_span = alloc_span<int32_t>(scratch, HASH_SIZE);
+  auto prev_span = alloc_span<int32_t>(scratch, WINDOW_SIZE);
 
-  if (scratch.size() < reserved_reuse_area)
-    throw std::runtime_error("Scratch buffer too small for reuse area");
+  std::fill(head_span.begin(), head_span.end(), -1);
+  std::fill(prev_span.begin(), prev_span.end(), -1);
 
-  auto head_span = ScratchVector<int32_t>(scratch, HASH_SIZE);
-  auto prev_span = ScratchVector<int32_t>(scratch, WINDOW_SIZE);
-  int32_t *head = head_span.data.data();
-  int32_t *prev = prev_span.data.data();
+  // Mark the end of the reuse area
+  uint8_t* const reuse_end = scratch.data();
+  size_t reuse_size = reuse_end - scratch_base;
 
-  std::fill(head_span.data.begin(), head_span.data.end(), -1);
-  std::fill(prev_span.data.begin(), prev_span.data.end(), -1);
-
-  size_t used_so_far = scratch.data() - scratch_base;
-  if (reserved_reuse_area > used_so_far) {
-    size_t padding = reserved_reuse_area - used_so_far;
-    if (scratch.size() < padding)
-      throw std::bad_alloc();
-    scratch = scratch.subspan(padding);
-  }
-
+  // --- Allocate Stream Buffers ---
   StreamSplitter streams(scratch, input.size());
+
+  // Pointers for hot loop
+  int32_t *head = head_span.data();
+  int32_t *prev = prev_span.data();
 
   const uint8_t *ip = input.data();
   const uint8_t *const ip_start = ip;
@@ -219,8 +202,7 @@ size_t LZCompressor<Mode>::compress(std::span<const uint8_t> input,
 
   int eff_level = (level < 1) ? 1 : level;
   uint32_t max_chain = (1u << eff_level);
-  if (max_chain > 4096)
-    max_chain = 4096;
+  if (max_chain > 4096) max_chain = 4096;
 
   while (ip < ip_end) {
     size_t best_len = 0;
@@ -279,48 +261,46 @@ size_t LZCompressor<Mode>::compress(std::span<const uint8_t> input,
   uint8_t *op = output.data();
   uint8_t *const op_end = op + output.size();
 
-  if (op + 8 > op_end)
-    throw std::runtime_error("Output too small for header");
+  if (op + 8 > op_end) throw std::runtime_error("Output too small for header");
   uint64_t total_size = static_cast<uint64_t>(input.size());
   std::memcpy(op, &total_size, 8);
   op += 8;
 
-  if (op + 16 > op_end)
-    throw std::runtime_error("Output too small for stream headers");
+  if (op + 16 > op_end) throw std::runtime_error("Output too small for stream headers");
   uint8_t *size_ptr = op;
   op += 16;
 
-  std::span<uint8_t> fse_reuse_scratch(scratch_base, reserved_reuse_area);
+  // Construct reuse scratch for FSE from the base of the provided scratch
+  std::span<uint8_t> fse_reuse_scratch(scratch_base, reuse_size);
+  FSECompressor fse;
 
-  auto compress_stream = [&](std::span<uint8_t> src, uint8_t *&dest, int idx) {
+  auto compress_stream = [&](std::span<uint8_t> full_buffer, size_t count, uint8_t *&dest, int idx) {
+    std::span<uint8_t> src = full_buffer.subspan(0, count);
+    
     if (src.empty()) {
       std::memset(size_ptr + (idx * 4), 0, 4);
       return;
     }
 
-    if (dest >= op_end)
-      throw std::runtime_error("Output buffer exhausted");
+    if (dest >= op_end) throw std::runtime_error("Output buffer exhausted");
 
     size_t remaining = op_end - dest;
-    // Safety check for FSE header space
-    if (remaining < 64)
-      throw std::runtime_error("Output buffer exhausted before FSE stream");
+    if (remaining < 64) throw std::runtime_error("Output buffer exhausted before FSE stream");
 
     size_t comp_sz = fse.compress(src, std::span<uint8_t>(dest, remaining),
                                   fse_reuse_scratch, level);
 
-    if (dest + comp_sz > op_end)
-      throw std::runtime_error("FSE wrote past end of buffer");
+    if (dest + comp_sz > op_end) throw std::runtime_error("FSE wrote past end of buffer");
 
     uint32_t sz_u32 = static_cast<uint32_t>(comp_sz);
     std::memcpy(size_ptr + (idx * 4), &sz_u32, 4);
     dest += comp_sz;
   };
 
-  compress_stream(streams.controls.filled(), op, 0);
-  compress_stream(streams.literals.filled(), op, 1);
-  compress_stream(streams.lengths.filled(), op, 2);
-  compress_stream(streams.offsets.filled(), op, 3);
+  compress_stream(streams.controls, streams.idx_controls, op, 0);
+  compress_stream(streams.literals, streams.idx_literals, op, 1);
+  compress_stream(streams.lengths,  streams.idx_lengths,  op, 2);
+  compress_stream(streams.offsets,  streams.idx_offsets,  op, 3);
 
   return op - output.data();
 }
@@ -335,15 +315,13 @@ size_t LZCompressor<Mode>::decompress(std::span<const uint8_t> input,
   const uint8_t *ip = input.data();
   const uint8_t *ip_end = ip + input.size();
 
-  if (input.size() < 24)
-    throw std::runtime_error("Input too small");
+  if (input.size() < 24) throw std::runtime_error("Input too small");
 
   uint64_t original_size;
   std::memcpy(&original_size, ip, 8);
   ip += 8;
 
-  if (output.size() < original_size)
-    throw std::runtime_error("Output buffer too small");
+  if (output.size() < original_size) throw std::runtime_error("Output buffer too small");
 
   uint32_t sz_ctrl, sz_lit, sz_len, sz_off;
   std::memcpy(&sz_ctrl, ip + 0, 4);
@@ -354,31 +332,37 @@ size_t LZCompressor<Mode>::decompress(std::span<const uint8_t> input,
 
   FSECompressor fse;
 
-  auto buf_ctrl = ScratchVector<uint8_t>(scratch, max_controls_size(original_size));
-  auto buf_lit = ScratchVector<uint8_t>(scratch, max_literals_size(original_size));
-  auto buf_len = ScratchVector<uint8_t>(scratch, max_lengths_size(original_size));
-  auto buf_off = ScratchVector<uint8_t>(scratch, max_offsets_size(original_size));
+  // Allocate buffers directly using span_allocator
+  auto buf_ctrl = alloc_span<uint8_t>(scratch, max_controls_size(original_size));
+  auto buf_lit  = alloc_span<uint8_t>(scratch, max_literals_size(original_size));
+  auto buf_len  = alloc_span<uint8_t>(scratch, max_lengths_size(original_size));
+  auto buf_off  = alloc_span<uint8_t>(scratch, max_offsets_size(original_size));
+  
+  size_t cnt_ctrl = 0;
+  size_t cnt_lit = 0;
+  size_t cnt_len = 0;
+  size_t cnt_off = 0;
 
-  auto decompress_stream = [&](size_t comp_sz, ScratchVector<uint8_t> &dest) {
-    if (comp_sz == 0)
+  auto decompress_stream = [&](size_t comp_sz, std::span<uint8_t> dest, size_t &out_count) {
+    if (comp_sz == 0) {
+      out_count = 0;
       return;
-    if (ip + comp_sz > ip_end)
-      throw std::runtime_error("Truncated FSE stream");
+    }
+    if (ip + comp_sz > ip_end) throw std::runtime_error("Truncated FSE stream");
 
     size_t written = fse.decompress(std::span<const uint8_t>(ip, comp_sz),
-                                    dest.data, scratch);
+                                    dest, scratch);
 
-    if (written > dest.data.size())
-      throw std::runtime_error("FSE decompressed more than expected");
+    if (written > dest.size()) throw std::runtime_error("FSE decompressed more than expected");
 
-    dest.count = written;
+    out_count = written;
     ip += comp_sz;
   };
 
-  decompress_stream(sz_ctrl, buf_ctrl);
-  decompress_stream(sz_lit, buf_lit);
-  decompress_stream(sz_len, buf_len);
-  decompress_stream(sz_off, buf_off);
+  decompress_stream(sz_ctrl, buf_ctrl, cnt_ctrl);
+  decompress_stream(sz_lit,  buf_lit,  cnt_lit);
+  decompress_stream(sz_len,  buf_len,  cnt_len);
+  decompress_stream(sz_off,  buf_off,  cnt_off);
 
   uint8_t *op = output.data();
   size_t lit_idx = 0;
@@ -387,50 +371,42 @@ size_t LZCompressor<Mode>::decompress(std::span<const uint8_t> input,
   size_t bytes_decoded = 0;
   constexpr size_t MIN_MATCH_LEN = 3;
 
-  for (size_t c = 0; c < buf_ctrl.count; ++c) {
-    uint8_t control = buf_ctrl.data[c];
+  for (size_t c = 0; c < cnt_ctrl; ++c) {
+    uint8_t control = buf_ctrl[c];
     for (int i = 0; i < 8 && bytes_decoded < original_size; ++i) {
       if ((control >> i) & 1) {
-        if (len_idx >= buf_len.count)
-          throw std::runtime_error("Len buffer underflow");
+        if (len_idx >= cnt_len) throw std::runtime_error("Len buffer underflow");
 
-        size_t len_code = buf_len.data[len_idx++];
+        size_t len_code = buf_len[len_idx++];
         size_t match_len = len_code + MIN_MATCH_LEN;
 
         if (len_code == 255) {
-          while (len_idx < buf_len.count) {
-            uint8_t ext = buf_len.data[len_idx++];
+          while (len_idx < cnt_len) {
+            uint8_t ext = buf_len[len_idx++];
             match_len += ext;
             if (ext != 255)
               break;
           }
         }
 
-        if (off_idx + 1 >= buf_off.count)
-          throw std::runtime_error("Off buffer underflow");
+        if (off_idx + 1 >= cnt_off) throw std::runtime_error("Off buffer underflow");
 
-        size_t dist = static_cast<size_t>(buf_off.data[off_idx]) |
-                      (static_cast<size_t>(buf_off.data[off_idx + 1]) << 8);
+        size_t dist = static_cast<size_t>(buf_off[off_idx]) |
+                      (static_cast<size_t>(buf_off[off_idx + 1]) << 8);
         off_idx += 2;
 
-        if (dist == 0 || dist > bytes_decoded)
-          throw std::runtime_error("Invalid distance");
-
-        if (bytes_decoded + match_len > original_size)
-          throw std::runtime_error("Decoded data exceeds original size");
+        if (dist == 0 || dist > bytes_decoded) throw std::runtime_error("Invalid distance");
+        if (bytes_decoded + match_len > original_size) throw std::runtime_error("Decoded data exceeds original size");
 
         const uint8_t *src = op - dist;
         for (size_t k = 0; k < match_len; ++k)
           *op++ = *src++;
         bytes_decoded += match_len;
       } else {
-        if (lit_idx >= buf_lit.count)
-          throw std::runtime_error("Lit buffer underflow");
+        if (lit_idx >= cnt_lit) throw std::runtime_error("Lit buffer underflow");
+        if (bytes_decoded >= original_size) throw std::runtime_error("Decoded data exceeds original size");
 
-        if (bytes_decoded >= original_size)
-          throw std::runtime_error("Decoded data exceeds original size");
-
-        *op++ = buf_lit.data[lit_idx++];
+        *op++ = buf_lit[lit_idx++];
         bytes_decoded++;
       }
     }
